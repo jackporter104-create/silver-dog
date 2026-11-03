@@ -125,6 +125,23 @@ K, M, B, T, Qa, Qi … Dc, UDc … UQq (Unquinquagintillion) … Ce (Centillion)
 The HUD also spells the full name under the number ("Unquinquagintillion") and switches the rate to **/nanosecond**
 once income passes 1T/s.
 
+## Arena layout
+
+The arena is zoned and symmetric. Every position comes from `Config/Stations.luau` (map: `docs/arena-layout.png`):
+
+| Zone | Contents |
+|---|---|
+| Central Plaza (r ≤ 48) | Three Giant Pearl Clams. Spawn is just south of centre, facing north |
+| Inner ring (r = 66) | East: Auto-Clicker Lab + Battery Dock. West: Fin Forge + Investor Lounge |
+| Promenade (r = 83) | Circular stepping-stone walkway |
+| Outer ring (r = 102) | 10 generators in progression order, clockwise down the east arc, then up the west arc |
+| North/south axis | Clear lanes: Heavenly Stairway to the north, Evolution Altar to the south |
+| Rim (r ≥ 118) | Kelp forest backdrop, boulders, coral beds |
+
+Decor is placed only in designed coral beds and on the rim. `Stations.isClearForDecor` keeps it off walkways
+and stations. Rendering rule: no two visible faces are coplanar (each stacked layer has its own height) and no
+glowing sheets sit at camera height. Keep to both when adding geometry to avoid z-fighting flicker.
+
 ## Economy and pacing
 
 | System | Rule |
