@@ -1,8 +1,14 @@
 --!strict
 --[[
-	StationController: detects which station the local character stands at (cheap distance
-	checks at 10 Hz) and sends intent-only Action requests. The server re-validates
-	everything. Client throttles only keep requests under the server's Guard limits.
+	StationController: physical interaction with floor pads (cheap distance checks at 10 Hz).
+
+	  * Step on a pad: buys / activates once per step (step off and on again to repeat).
+	  * Press E (or gamepad X) near a pad: same action, repeatable.
+	  * Stand main pad of an owned, unmanaged stand: while you stand on it the stand keeps running.
+	  * Evolve pads: stand still on the pad for Evolution.CONFIRM_SECONDS to evolve (no accidents).
+
+	Requests are intent-only (the station id). The server re-validates ownership, cost and distance.
+	Client throttles only keep requests under the server's Guard limits.
 ]]
 
 local ContextActionService = game:GetService("ContextActionService")
@@ -13,7 +19,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Net = require(Shared.Net)
 local Signal = require(Shared.Signal)
 local Stations = require(Shared.Config.Stations)
-local BigNumber = require(Shared.BigNumber)
+local Evolution = require(Shared.Config.Evolution)
 
 local StateController = require(script.Parent.StateController)
 
@@ -22,18 +28,18 @@ type StationDef = Stations.StationDef
 local StationController = {}
 
 local SCAN_INTERVAL = 0.1
-local CLICK_INTERVAL = 1 / 14 -- under the server's 15/s Guard rate
-local ACTION_INTERVAL = 0.15
+local RUN_INTERVAL = 0.25 -- re-send rate while standing on a stand pad (server Guard: 10/s)
+local ACTION_INTERVAL = 0.2
 local INTERACT_ACTION = "OceanInteract"
 
 local player = Players.LocalPlayer
 local nearest: StationDef? = nil
+local standingOn: StationDef? = nil
+local standingSince = 0
+local evolveSent = false
 local lastSent: { [string]: number } = {}
 
 StationController.nearestChanged = Signal.new() :: Signal.Signal<StationDef?>
-StationController.clicked = Signal.new() :: Signal.Signal<BigNumber.BigNumber>
--- Fired when the player interacts with a station that needs a UI choice (Evolution).
-StationController.choiceRequested = Signal.new() :: Signal.Signal<StationDef>
 
 local function rootPosition(): Vector3?
 	local character = player.Character
@@ -44,24 +50,72 @@ local function rootPosition(): Vector3?
 	return nil
 end
 
+local function send(station: StationDef, interval: number)
+	local now = os.clock()
+	if now - (lastSent[station.id] or 0) < interval then
+		return
+	end
+	lastSent[station.id] = now
+	Net.get().Action:FireServer(station.id)
+end
+
+-- True when standing on this stand pad runs the stand (owned and no manager yet).
+local function isRunPad(station: StationDef): boolean
+	if station.kind ~= "StandMain" then
+		return false
+	end
+	local snap = StateController.snapshot()
+	local stand = snap and snap.stands[station.target or ""]
+	return stand ~= nil and stand.owned and not stand.managed
+end
+
+local function trigger(station: StationDef)
+	if station.kind == "Evolve" then
+		return -- evolving needs the hold-to-confirm on the pad
+	end
+	send(station, ACTION_INTERVAL)
+end
+
 local function scan()
 	local position = rootPosition()
-	local best: StationDef? = nil
+	local bestPrompt: StationDef? = nil
+	local onPad: StationDef? = nil
 	if position then
 		local bestDistance = math.huge
 		for _, station in Stations.LIST do
 			local offset = position - station.position
 			if math.abs(offset.Y) <= Stations.VERTICAL_TOLERANCE then
 				local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
-				if distance <= station.radius and distance < bestDistance then
-					best, bestDistance = station, distance
+				if distance <= station.promptRadius and distance < bestDistance then
+					bestPrompt, bestDistance = station, distance
+				end
+				if distance <= station.radius then
+					onPad = station
 				end
 			end
 		end
 	end
-	if best ~= nearest then
-		nearest = best
-		StationController.nearestChanged:Fire(best)
+
+	if bestPrompt ~= nearest then
+		nearest = bestPrompt
+		StationController.nearestChanged:Fire(bestPrompt)
+	end
+
+	local now = os.clock()
+	if onPad ~= standingOn then
+		standingOn = onPad
+		standingSince = now
+		evolveSent = false
+		if onPad then
+			trigger(onPad) -- stepping onto a pad buys once
+		end
+	elseif onPad then
+		if isRunPad(onPad) then
+			send(onPad, RUN_INTERVAL)
+		elseif onPad.kind == "Evolve" and not evolveSent and now - standingSince >= Evolution.CONFIRM_SECONDS then
+			evolveSent = true
+			send(onPad, ACTION_INTERVAL)
+		end
 	end
 end
 
@@ -69,30 +123,17 @@ function StationController.nearest(): StationDef?
 	return nearest
 end
 
--- Sends an intent for the current station. option: quantity (1/10) or perk index.
-function StationController.send(station: StationDef, option: number)
-	local now = os.clock()
-	local interval = if station.kind == "Clam" then CLICK_INTERVAL else ACTION_INTERVAL
-	if now - (lastSent[station.kind] or 0) < interval then
-		return
-	end
-	lastSent[station.kind] = now
-	Net.get().Action:FireServer(station.id, option)
-	if station.kind == "Clam" then
-		StationController.clicked:Fire(StateController.predictClick())
-	end
+function StationController.standingOn(): StationDef?
+	return standingOn
 end
 
-function StationController.interact(option: number)
-	local station = nearest
-	if not station then
-		return
+-- 0..1 progress of the evolve hold on the current pad (0 when not on an evolve pad).
+function StationController.evolveHoldProgress(): number
+	local station = standingOn
+	if not station or station.kind ~= "Evolve" or evolveSent then
+		return 0
 	end
-	if station.kind == "Evolution" then
-		StationController.choiceRequested:Fire(station)
-		return
-	end
-	StationController.send(station, option)
+	return math.clamp((os.clock() - standingSince) / Evolution.CONFIRM_SECONDS, 0, 1)
 end
 
 function StationController.init()
@@ -103,8 +144,9 @@ function StationController.init()
 		end
 	end)
 	ContextActionService:BindAction(INTERACT_ACTION, function(_name: string, state: Enum.UserInputState): Enum.ContextActionResult
-		if state == Enum.UserInputState.Begin then
-			StationController.interact(1)
+		local station = nearest
+		if state == Enum.UserInputState.Begin and station then
+			trigger(station)
 			return Enum.ContextActionResult.Sink
 		end
 		return Enum.ContextActionResult.Pass

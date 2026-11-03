@@ -2,12 +2,12 @@
 --[[
 	NetService: the only entry point for client requests.
 
-	Pipeline for every Action(stationId, option):
+	Pipeline for every Action(stationId):
 	  1. Type and shape validation (malformed payloads are dropped and count as strikes)
 	  2. Station lookup against the authoritative layout
-	  3. Guard rate limit, per player per station kind
+	  3. Guard rate limit, per player per action kind
 	  4. Session loaded?
-	  5. Server-side proximity check (character within the station radius)
+	  5. Server-side proximity check (character within the pad's prompt radius + tolerance)
 	  6. EconomyService does the math and state change
 ]]
 
@@ -28,24 +28,22 @@ local NetService = {}
 
 local SYNC_REQUEST = "__sync"
 local MAX_ID_LENGTH = 48
-local MAX_OPTION = 16
-local KICK_STRIKES = 150 -- sustained, extreme spam only; normal over-clicking is just dropped
+local KICK_STRIKES = 150 -- sustained, extreme spam only; normal over-sending is just dropped
 
 local KEY_BY_KIND: { [Types.StationKind]: string } = {
-	Clam = "Click",
-	Generator = "Purchase",
-	ClickUpgrade = "Purchase",
-	Investor = "Purchase",
-	AutoClicker = "Purchase",
+	StandMain = "Run",
+	Multiplier = "Purchase",
+	Speed = "Purchase",
+	Manager = "Purchase",
 	Statue = "Purchase",
-	Battery = "Battery",
-	Evolution = "Evolution",
+	Buff = "Buff",
+	Evolve = "Evolution",
 }
 
 local guard = Guard.new({
-	Click = { rate = 15, burst = 25 }, -- humans peak around 12-15 taps/s
+	Run = { rate = 10, burst = 15 }, -- the client re-sends ~4/s while standing on a stand pad
 	Purchase = { rate = 8, burst = 12 },
-	Battery = { rate = 1, burst = 2 },
+	Buff = { rate = 2, burst = 3 },
 	Evolution = { rate = 0.5, burst = 1 },
 	Sync = { rate = 0.2, burst = 2 },
 	Malformed = { rate = 0.05, burst = 3 },
@@ -58,8 +56,8 @@ local function malformed(player: Player)
 	guard:allow(player, "Malformed")
 end
 
-local function onAction(player: Player, stationId: unknown, option: unknown)
-	if typeof(stationId) ~= "string" or #stationId == 0 or #stationId > MAX_ID_LENGTH then
+local function onAction(player: Player, stationId: unknown, ...: unknown)
+	if typeof(stationId) ~= "string" or #stationId == 0 or #stationId > MAX_ID_LENGTH or select("#", ...) > 0 then
 		malformed(player)
 		return
 	end
@@ -76,16 +74,6 @@ local function onAction(player: Player, stationId: unknown, option: unknown)
 		malformed(player)
 		return
 	end
-
-	local parsedOption = 1
-	if option ~= nil then
-		if typeof(option) ~= "number" or option ~= option or option % 1 ~= 0 or option < 0 or option > MAX_OPTION then
-			malformed(player)
-			return
-		end
-		parsedOption = option
-	end
-
 	if not guard:allow(player, KEY_BY_KIND[station.kind]) then
 		return
 	end
@@ -95,7 +83,7 @@ local function onAction(player: Player, stationId: unknown, option: unknown)
 	if not ArenaService.isNear(player, station) then
 		return
 	end
-	EconomyService.handleAction(player, station, parsedOption)
+	EconomyService.handleAction(player, station)
 end
 
 function NetService.init()

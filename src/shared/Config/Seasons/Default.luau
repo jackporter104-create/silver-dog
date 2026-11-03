@@ -12,9 +12,8 @@ local season: Types.SeasonDefinition = {
 	endsAt = nil,
 	economy = {
 		incomeMultiplier = 1,
-		clickMultiplier = 1,
 		costMultiplier = 1,
-		generatorMultipliers = {},
+		standMultipliers = {},
 	},
 	theme = {
 		waterTint = Color3.fromRGB(150, 210, 255),

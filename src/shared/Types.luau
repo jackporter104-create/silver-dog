@@ -4,11 +4,19 @@
 local BigNumber = require(script.Parent.BigNumber)
 type BigNumber = BigNumber.BigNumber
 
-export type IncomeSource = "Click" | "Passive" | "Auto" | "Offline" | "Investor" | "All"
+-- Per-stand progress. level: 0 = not owned, 1 = owned. multiplier/speed are upgrade levels.
+export type StandState = {
+	level: number,
+	multiplier: number,
+	speed: number,
+	managerHired: boolean,
+}
 
-export type AutoClickerState = {
-	tier: number, -- 0 = not owned
-	charge: number, -- remaining automated clicks (ignored when the tier is infinite)
+-- Per-buff state. Times are server os.time() seconds (0 = never).
+export type BuffState = {
+	unlocked: boolean,
+	activeUntil: number,
+	readyAt: number,
 }
 
 export type EvolutionState = {
@@ -23,28 +31,25 @@ export type PlayerData = {
 	lifetimeEarned: BigNumber, -- earned during the current evolution run (gates evolving)
 	totalEarned: BigNumber, -- all-time
 	bestCurrency: BigNumber, -- highest balance ever held (gates the Heavenly Stairway)
-	investors: number,
-	clickLevel: number,
-	generators: { [string]: number },
-	autoClicker: AutoClickerState,
+	stands: { [string]: StandState },
+	buffs: { [string]: BuffState },
 	evolution: EvolutionState,
 	statues: { [string]: boolean },
 	lastOnline: number, -- server os.time()
-	totalClicks: number,
+	totalRuns: number, -- manual stand cycles
 	receipts: { [string]: number }, -- processed developer-product purchase ids -> os.time()
 }
 
 -- Monetization flags resolved live (never trusted from saved data).
 export type Entitlements = {
-	infiniteAutoClicker: boolean,
+	doubleIncome: boolean,
 }
 
 -- Season or event economy overrides. 1 = neutral.
 export type EconomyModifiers = {
 	incomeMultiplier: number,
-	clickMultiplier: number,
 	costMultiplier: number,
-	generatorMultipliers: { [string]: number },
+	standMultipliers: { [string]: number },
 }
 
 export type SeasonTheme = {
@@ -69,37 +74,46 @@ export type SeasonDefinition = {
 	theme: SeasonTheme,
 }
 
-export type StationKind =
-	"Clam"
-	| "Generator"
-	| "ClickUpgrade"
-	| "Investor"
-	| "AutoClicker"
-	| "Battery"
-	| "Evolution"
-	| "Statue"
+export type StationKind = "StandMain" | "Multiplier" | "Speed" | "Manager" | "Buff" | "Evolve" | "Statue"
 
 -- ===== Network payloads (server -> client) =====
 
 export type StationView = {
 	level: number,
 	cost: BigNumber.Serialized?, -- nil when maxed or free
-	cost10: BigNumber.Serialized?, -- bulk price for stations that support x10
 	locked: boolean,
 	lockReason: string?,
 	maxed: boolean,
+}
+
+export type StandView = {
+	owned: boolean,
+	managed: boolean,
+	multiplier: number,
+	speed: number,
+	interval: number, -- seconds per cycle
+	cycleValue: BigNumber.Serialized, -- per automated cycle, buff included
+	manualValue: BigNumber.Serialized, -- per hand-run cycle, buff included
+	rate: BigNumber.Serialized, -- per second while cycling
+	cycleEndsAt: number?, -- server time of the running manual cycle
+}
+
+export type BuffView = {
+	unlocked: boolean,
+	activeRemaining: number, -- seconds, relative to Snapshot.serverTime
+	cooldownRemaining: number,
 }
 
 export type PerkView = { id: string, name: string, description: string, stacks: number }
 
 export type Snapshot = {
 	currency: BigNumber.Serialized,
-	rate: BigNumber.Serialized,
+	rate: BigNumber.Serialized, -- managed income per second
 	serverTime: number,
-	clickValue: BigNumber.Serialized,
-	investors: number,
-	investorBonus: number, -- e.g. 0.37 = +37%
+	globalMultiplier: number, -- strongest active buff (1 = none)
 	stations: { [string]: StationView },
+	stands: { [string]: StandView },
+	buffs: { [string]: BuffView },
 	evolution: {
 		level: number,
 		multiplier: BigNumber.Serialized,
@@ -109,16 +123,16 @@ export type Snapshot = {
 		canEvolve: boolean,
 		perks: { PerkView },
 	},
-	autoClicker: {
-		tier: number,
-		charge: number,
-		capacity: number,
-		infinite: boolean,
-		clicksPerSecond: number,
-	},
 	statues: { [string]: boolean },
 	stairwayUnlocked: boolean,
 	seasonId: string,
+}
+
+-- Sent when a hand-run cycle starts, so the client can animate it.
+export type CycleEvent = {
+	standId: string,
+	endsAt: number, -- server time
+	value: BigNumber.Serialized,
 }
 
 export type NotifyKind = "Info" | "Success" | "Error" | "Offline" | "Evolution"
@@ -130,7 +144,6 @@ export type Notification = {
 
 export type UiConfig = {
 	variant: string,
-	tapButtonScale: number,
 	accentColor: Color3,
 	showPerNanosecond: boolean,
 	compactHud: boolean,

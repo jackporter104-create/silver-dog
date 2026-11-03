@@ -1,14 +1,18 @@
 --!strict
 --[[
-	EconomyService: the single authority over currency.
+	EconomyService: the single authority over currency ("Business Empire" stand economy).
 
-	* Holds a Session per loaded player with cached rates. Rates are recomputed only when state
-	  changes, never per tick.
-	* Ticks every Net.TICK_INTERVAL. It applies passive income and auto-clicks, then sends a tiny
-	  Tick payload. The client extrapolates between ticks for the "nanosecond" effect.
-	* All purchases and evolutions are validated here. The client only says what it touched.
-	* Uses BigNumber throughout. Values below 1e15 stay plain doubles internally, so the
-	  transition to mantissa/exponent form is invisible to this code.
+	State per player (PlayerData):
+	  stands[standId] = { level (0 locked / 1 owned), multiplier, speed, managerHired }
+	  buffs[buffId]   = { unlocked, activeUntil, readyAt }  (server os.time())
+
+	* Managed stands produce continuously: rate = cycle value / interval.
+	* Unmanaged stands produce only while the player stands on the stand's main pad.
+	  Each request starts one cycle (if none is running) and the payout lands when it ends.
+	* Rates are cached per session and recomputed only when state changes or a buff starts/ends.
+	* A 1 Hz tick applies income, completes hand-run cycles and sends a tiny Tick payload.
+	  The client extrapolates between ticks.
+	* All purchases are validated here. The client only says which pad it used.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -24,27 +28,29 @@ local Economy = require(Shared.Config.Economy)
 local Evolution = require(Shared.Config.Evolution)
 local Statues = require(Shared.Config.Statues)
 local Stations = require(Shared.Config.Stations)
-local Monetization = require(Shared.Config.Monetization)
 
 local DataService = require(script.Parent.DataService)
 local SeasonService = require(script.Parent.SeasonService)
 
 type BigNumber = BigNumber.BigNumber
 type PlayerData = Types.PlayerData
+type StandState = Types.StandState
 type Entitlements = Types.Entitlements
 type StationDef = Stations.StationDef
+type StandDef = Economy.StandDef
+
+type ManualCycle = {
+	endsAt: number, -- os.clock()
+}
 
 type Session = {
 	player: Player,
 	data: PlayerData,
 	entitlements: Entitlements,
 	lastTick: number,
-	autoClickRemainder: number,
-	passive: BigNumber,
-	clickValue: BigNumber,
-	autoClickValue: BigNumber,
-	autoCps: number,
-	autoInfinite: boolean,
+	buff: number, -- active global buff multiplier the cached rate was computed with
+	rate: BigNumber, -- managed income per second
+	cycles: { [string]: ManualCycle },
 	evolveReadyNotified: boolean,
 	stairwayNotified: boolean,
 	lastErrorAt: number,
@@ -56,7 +62,6 @@ local EconomyService = {}
 
 local sessions: { [Player]: Session } = {}
 local ZERO = BigNumber.ZERO
-local LIMITS = Economy.LIMITS
 local ERROR_COOLDOWN = 0.4
 
 local function mods(): Types.EconomyModifiers
@@ -87,26 +92,32 @@ local function fail(s: Session, text: string)
 	notify(s, "Error", text)
 end
 
--- ===== Rates & state =====
+local function formatDuration(seconds: number): string
+	seconds = math.max(0, math.ceil(seconds))
+	local hours = seconds // 3600
+	local minutes = (seconds % 3600) // 60
+	if hours > 0 then
+		return string.format("%dh %dm", hours, minutes)
+	elseif minutes > 0 then
+		return string.format("%dm %ds", minutes, seconds % 60)
+	end
+	return string.format("%ds", seconds)
+end
+
+-- ===== State helpers =====
+
+local function standOf(data: PlayerData, standId: string): StandState
+	local state = data.stands[standId]
+	if not state then
+		state = { level = 0, multiplier = 0, speed = 0, managerHired = false }
+		data.stands[standId] = state
+	end
+	return state
+end
 
 local function refreshRates(s: Session)
-	local d, m = s.data, mods()
-	s.clickValue = EconomyMath.clickValue(d, m)
-	s.passive = EconomyMath.passivePerSecond(d, m)
-	s.autoClickValue = EconomyMath.autoClickValue(d, m)
-	s.autoCps = EconomyMath.autoClicksPerSecond(d, s.entitlements)
-	s.autoInfinite = EconomyMath.isAutoClickerInfinite(d, s.entitlements)
-end
-
-local function autoRunning(s: Session): boolean
-	return s.autoCps > 0 and (s.autoInfinite or s.data.autoClicker.charge > 0)
-end
-
-local function currentRate(s: Session): BigNumber
-	if autoRunning(s) then
-		return BigNumber.add(s.passive, BigNumber.mulNumber(s.autoClickValue, s.autoCps))
-	end
-	return s.passive
+	s.buff = EconomyMath.activeBuffMultiplier(s.data, os.time())
+	s.rate = EconomyMath.managedRate(s.data, mods(), s.entitlements, s.buff)
 end
 
 local function earn(s: Session, amount: BigNumber)
@@ -129,13 +140,23 @@ local function trySpend(s: Session, cost: BigNumber): boolean
 	return true
 end
 
+-- Unlocks buff pads whose milestone (owned stand count) is now reached. Unlocks persist until Evolution.
+local function unlockBuffs(s: Session)
+	for _, def in Economy.BUFFS do
+		local state = s.data.buffs[def.id]
+		if (not state or not state.unlocked) and EconomyMath.isBuffMilestoneReached(s.data, def) then
+			s.data.buffs[def.id] = { unlocked = true, activeUntil = 0, readyAt = 0 }
+			notify(s, "Success", string.format("New global buff pad unlocked in the plaza: %s (x%d)!", def.name, def.multiplier))
+		end
+	end
+end
+
 -- ===== Snapshot =====
 
-local function view(level: number, cost: BigNumber?, cost10: BigNumber?, locked: boolean, lockReason: string?, maxed: boolean): Types.StationView
+local function view(level: number, cost: BigNumber?, locked: boolean, lockReason: string?, maxed: boolean): Types.StationView
 	return {
 		level = level,
 		cost = if cost and not maxed then BigNumber.serialize(cost) else nil,
-		cost10 = if cost10 and not maxed then BigNumber.serialize(cost10) else nil,
 		locked = locked,
 		lockReason = lockReason,
 		maxed = maxed,
@@ -145,81 +166,82 @@ end
 local function stationView(s: Session, station: StationDef): Types.StationView
 	local d, m = s.data, mods()
 	local kind = station.kind
-	if kind == "Generator" then
-		local def = Economy.GENERATOR_BY_ID[station.target or ""]
-		local owned = d.generators[def.id] or 0
-		local locked = d.investors < def.requiredInvestors
-		return view(
-			owned,
-			EconomyMath.generatorCost(def, owned, 1, m),
-			EconomyMath.generatorCost(def, owned, 10, m),
-			locked,
-			if locked then "Needs " .. def.requiredInvestors .. " Investors" else nil,
-			owned >= LIMITS.maxLevel
-		)
-	elseif kind == "ClickUpgrade" then
-		return view(
-			d.clickLevel,
-			EconomyMath.clickUpgradeCost(d.clickLevel, 1, m),
-			EconomyMath.clickUpgradeCost(d.clickLevel, 10, m),
-			false,
-			nil,
-			d.clickLevel >= LIMITS.maxLevel
-		)
-	elseif kind == "Investor" then
-		return view(
-			d.investors,
-			EconomyMath.investorCost(d.investors, 1, m),
-			EconomyMath.investorCost(d.investors, 10, m),
-			false,
-			nil,
-			d.investors >= LIMITS.maxInvestors
-		)
-	elseif kind == "AutoClicker" then
-		local nextTier = d.autoClicker.tier + 1
-		local def = EconomyMath.autoClickerTier(nextTier)
-		if not def then
-			return view(d.autoClicker.tier, nil, nil, false, nil, true)
+	local target = station.target or ""
+	if kind == "StandMain" or kind == "Multiplier" or kind == "Speed" or kind == "Manager" then
+		local def = Economy.STAND_BY_ID[target]
+		local state = EconomyMath.standState(d, def.id)
+		local owned = state.level > 0
+		if kind == "StandMain" then
+			return view(state.level, if owned then nil else EconomyMath.deedCost(def, m), false, nil, false)
 		end
-		local locked = d.evolution.level < def.requiredEvolution
-		return view(
-			d.autoClicker.tier,
-			EconomyMath.autoClickerTierCost(nextTier, m),
-			nil,
-			locked,
-			if locked then "Reach Evolution " .. def.requiredEvolution else nil,
-			false
-		)
-	elseif kind == "Battery" then
-		local locked = d.autoClicker.tier == 0 and not s.entitlements.infiniteAutoClicker
-		return view(d.autoClicker.tier, nil, nil, locked, if locked then "Buy an Auto-Clicker first" else nil, s.autoInfinite)
-	elseif kind == "Evolution" then
+		local lockReason = if owned then nil else "Unlock " .. def.name .. " first"
+		if kind == "Multiplier" then
+			return view(state.multiplier, EconomyMath.multiplierCost(def, state.multiplier, m), not owned, lockReason, state.multiplier >= Economy.MAX_MULTIPLIER_LEVEL)
+		elseif kind == "Speed" then
+			local cost = EconomyMath.speedCost(def, state.speed, m)
+			return view(state.speed, cost, not owned, lockReason, cost == nil)
+		end
+		return view(if state.managerHired then 1 else 0, EconomyMath.managerCost(def, m), not owned, lockReason, state.managerHired)
+	elseif kind == "Buff" then
+		local def = Economy.BUFF_BY_ID[target]
+		local state = d.buffs[def.id]
+		local unlocked = state ~= nil and state.unlocked
+		return view(0, nil, not unlocked, if unlocked then nil else "Own " .. def.requiredStands .. " stands", false)
+	elseif kind == "Evolve" then
 		local requirement = EconomyMath.evolutionRequirement(d.evolution.level)
 		local maxed = requirement == nil
 		local locked = not maxed and not EconomyMath.canEvolve(d)
-		return view(
-			d.evolution.level,
-			nil,
-			nil,
-			locked,
-			if locked and requirement then "Earn " .. NumberFormat.format(requirement) .. " this run" else nil,
-			maxed
-		)
+		return view(d.evolution.perks[target] or 0, nil, locked, if locked and requirement then "Earn " .. NumberFormat.format(requirement) .. " this run" else nil, maxed)
 	elseif kind == "Statue" then
-		local def = Statues.BY_ID[station.target or ""]
+		local def = Statues.BY_ID[target]
 		local owned = d.statues[def.id] == true
 		local locked = not EconomyMath.isStairwayUnlocked(d)
-		return view(if owned then 1 else 0, EconomyMath.statueCost(def), nil, locked, if locked then "Heavenly Stairway locked" else nil, owned)
+		return view(if owned then 1 else 0, EconomyMath.statueCost(def), locked, if locked then "Heavenly Stairway locked" else nil, owned)
 	end
-	return view(0, nil, nil, false, nil, false)
+	return view(0, nil, false, nil, false)
+end
+
+local function standView(s: Session, def: StandDef, serverNow: number, clockNow: number): Types.StandView
+	local d, m, ent = s.data, mods(), s.entitlements
+	local state = EconomyMath.standState(d, def.id)
+	local cycle = s.cycles[def.id]
+	return {
+		owned = state.level > 0,
+		managed = state.level > 0 and state.managerHired,
+		multiplier = state.multiplier,
+		speed = state.speed,
+		interval = EconomyMath.standInterval(d, def),
+		cycleValue = BigNumber.serialize(EconomyMath.standCycleValue(d, def, m, ent, s.buff)),
+		manualValue = BigNumber.serialize(EconomyMath.manualCycleValue(d, def, m, ent, s.buff)),
+		rate = BigNumber.serialize(EconomyMath.standRate(d, def, m, ent, s.buff)),
+		cycleEndsAt = if cycle then serverNow + (cycle.endsAt - clockNow) else nil,
+	}
 end
 
 local function buildSnapshot(s: Session): Types.Snapshot
 	local d = s.data
+	local serverNow = Workspace:GetServerTimeNow()
+	local clockNow = os.clock()
+	local osNow = os.time()
+
 	local stationViews: { [string]: Types.StationView } = {}
 	for _, station in Stations.LIST do
 		stationViews[station.id] = stationView(s, station)
 	end
+	local stands: { [string]: Types.StandView } = {}
+	for _, def in Economy.STANDS do
+		stands[def.id] = standView(s, def, serverNow, clockNow)
+	end
+	local buffs: { [string]: Types.BuffView } = {}
+	for _, def in Economy.BUFFS do
+		local state = d.buffs[def.id]
+		buffs[def.id] = {
+			unlocked = state ~= nil and state.unlocked,
+			activeRemaining = if state then math.max(0, state.activeUntil - osNow) else 0,
+			cooldownRemaining = if state then math.max(0, state.readyAt - osNow) else 0,
+		}
+	end
+
 	local level = d.evolution.level
 	local requirement = EconomyMath.evolutionRequirement(level)
 	local perks: { Types.PerkView } = {}
@@ -228,12 +250,12 @@ local function buildSnapshot(s: Session): Types.Snapshot
 	end
 	return {
 		currency = BigNumber.serialize(d.currency),
-		rate = BigNumber.serialize(currentRate(s)),
-		serverTime = Workspace:GetServerTimeNow(),
-		clickValue = BigNumber.serialize(s.clickValue),
-		investors = d.investors,
-		investorBonus = EconomyMath.investorBonusFraction(d),
+		rate = BigNumber.serialize(s.rate),
+		serverTime = serverNow,
+		globalMultiplier = s.buff,
 		stations = stationViews,
+		stands = stands,
+		buffs = buffs,
 		evolution = {
 			level = level,
 			multiplier = BigNumber.serialize(EconomyMath.evolutionMultiplier(level)),
@@ -242,13 +264,6 @@ local function buildSnapshot(s: Session): Types.Snapshot
 			progress = BigNumber.serialize(d.lifetimeEarned),
 			canEvolve = EconomyMath.canEvolve(d),
 			perks = perks,
-		},
-		autoClicker = {
-			tier = d.autoClicker.tier,
-			charge = d.autoClicker.charge,
-			capacity = EconomyMath.autoClickerCapacity(d),
-			infinite = s.autoInfinite,
-			clicksPerSecond = s.autoCps,
 		},
 		statues = table.clone(d.statues),
 		stairwayUnlocked = EconomyMath.isStairwayUnlocked(d),
@@ -276,108 +291,138 @@ local function saveSoon(s: Session)
 	task.spawn(DataService.saveAsync, s.player, false)
 end
 
+-- ===== Manual cycles =====
+
+-- Pays out a finished hand-run cycle. The buff active at completion applies.
+local function completeCycle(s: Session, def: StandDef, clockNow: number): boolean
+	local cycle = s.cycles[def.id]
+	if not cycle or clockNow < cycle.endsAt then
+		return false
+	end
+	s.cycles[def.id] = nil
+	earn(s, EconomyMath.manualCycleValue(s.data, def, mods(), s.entitlements, s.buff))
+	s.data.totalRuns += 1
+	return true
+end
+
+local function startCycle(s: Session, def: StandDef)
+	local clockNow = os.clock()
+	completeCycle(s, def, clockNow)
+	if s.cycles[def.id] then
+		return -- still running
+	end
+	local interval = EconomyMath.manualInterval(s.data, def)
+	s.cycles[def.id] = { endsAt = clockNow + interval }
+	local event: Types.CycleEvent = {
+		standId = def.id,
+		endsAt = Workspace:GetServerTimeNow() + interval,
+		value = BigNumber.serialize(EconomyMath.manualCycleValue(s.data, def, mods(), s.entitlements, s.buff)),
+	}
+	Net.get().Cycle:FireClient(s.player, event)
+end
+
 -- ===== Action handlers =====
 
-local function quantityFrom(option: number): number
-	return if option == 10 then 10 else 1
+local function onStandMain(s: Session, def: StandDef)
+	local state = standOf(s.data, def.id)
+	if state.level == 0 then
+		if trySpend(s, EconomyMath.deedCost(def, mods())) then
+			state.level = 1
+			unlockBuffs(s)
+			changed(s)
+			notify(s, "Success", def.name .. " unlocked! Stand on its pad to run it, or hire a manager.")
+			saveSoon(s)
+		end
+		return
+	end
+	if state.managerHired then
+		return -- the manager runs it; nothing to do by hand
+	end
+	startCycle(s, def)
 end
 
-local function onClam(s: Session, _station: StationDef, _option: number)
-	earn(s, s.clickValue)
-	s.data.totalClicks += 1
-end
-
-local function onGenerator(s: Session, station: StationDef, option: number)
-	local def = Economy.GENERATOR_BY_ID[station.target or ""]
-	if not def then
+local function onMultiplier(s: Session, def: StandDef)
+	local state = standOf(s.data, def.id)
+	if state.level == 0 then
+		fail(s, "Unlock " .. def.name .. " first!")
 		return
 	end
-	local d = s.data
-	if d.investors < def.requiredInvestors then
-		fail(s, def.name .. " needs " .. def.requiredInvestors .. " Investors!")
+	if state.multiplier >= Economy.MAX_MULTIPLIER_LEVEL then
 		return
 	end
-	local owned = d.generators[def.id] or 0
-	local quantity = math.min(quantityFrom(option), LIMITS.maxLevel - owned)
-	if quantity <= 0 then
-		return
-	end
-	if trySpend(s, EconomyMath.generatorCost(def, owned, quantity, mods())) then
-		d.generators[def.id] = owned + quantity
+	if trySpend(s, EconomyMath.multiplierCost(def, state.multiplier, mods())) then
+		state.multiplier += 1
 		changed(s)
 	end
 end
 
-local function onClickUpgrade(s: Session, _station: StationDef, option: number)
-	local d = s.data
-	local quantity = math.min(quantityFrom(option), LIMITS.maxLevel - d.clickLevel)
-	if quantity <= 0 then
+local function onSpeed(s: Session, def: StandDef)
+	local state = standOf(s.data, def.id)
+	if state.level == 0 then
+		fail(s, "Unlock " .. def.name .. " first!")
 		return
 	end
-	if trySpend(s, EconomyMath.clickUpgradeCost(d.clickLevel, quantity, mods())) then
-		d.clickLevel += quantity
-		changed(s)
-	end
-end
-
-local function onInvestor(s: Session, _station: StationDef, option: number)
-	local d = s.data
-	local quantity = math.min(quantityFrom(option), LIMITS.maxInvestors - d.investors)
-	if quantity <= 0 then
-		return
-	end
-	if trySpend(s, EconomyMath.investorCost(d.investors, quantity, mods())) then
-		d.investors += quantity
-		changed(s)
-	end
-end
-
-local function onAutoClicker(s: Session, _station: StationDef, _option: number)
-	local d = s.data
-	local nextTier = d.autoClicker.tier + 1
-	local def = EconomyMath.autoClickerTier(nextTier)
-	local cost = EconomyMath.autoClickerTierCost(nextTier, mods())
-	if not def or not cost then
-		fail(s, "Your Auto-Clicker is fully upgraded!")
-		return
-	end
-	if d.evolution.level < def.requiredEvolution then
-		fail(s, "Reach Evolution " .. def.requiredEvolution .. " to unlock this upgrade!")
+	local cost = EconomyMath.speedCost(def, state.speed, mods())
+	if not cost then
+		fail(s, def.name .. " is already at max speed!")
 		return
 	end
 	if trySpend(s, cost) then
-		d.autoClicker.tier = nextTier
-		d.autoClicker.charge = def.capacity
+		state.speed += 1
 		changed(s)
-		local text = if def.infinite
-			then "INFINITE Auto-Clicker unlocked! It never runs out!"
-			else string.format("Auto-Clicker Mk.%d: %d clicks/s!", nextTier, def.clicksPerSecond)
-		notify(s, "Success", text)
+	end
+end
+
+local function onManager(s: Session, def: StandDef)
+	local state = standOf(s.data, def.id)
+	if state.level == 0 then
+		fail(s, "Unlock " .. def.name .. " first!")
+		return
+	end
+	if state.managerHired then
+		return
+	end
+	if trySpend(s, EconomyMath.managerCost(def, mods())) then
+		state.managerHired = true
+		completeCycle(s, def, math.huge) -- pay out any hand-run cycle in progress
+		changed(s)
+		notify(s, "Success", def.managerName .. " now runs " .. def.name .. ", even while you're offline!")
 		saveSoon(s)
 	end
 end
 
-local function onBattery(s: Session, _station: StationDef, _option: number)
-	local d = s.data
-	if s.autoInfinite then
-		notify(s, "Info", "Your Auto-Clicker never runs out!")
+local function onBuff(s: Session, buffId: string)
+	local def = Economy.BUFF_BY_ID[buffId]
+	local state = s.data.buffs[buffId]
+	if not def then
 		return
 	end
-	if d.autoClicker.tier == 0 then
-		fail(s, "Buy an Auto-Clicker at the Auto-Clicker Lab first!")
+	if not state or not state.unlocked then
+		fail(s, def.name .. " unlocks when you own " .. def.requiredStands .. " stands!")
 		return
 	end
-	local capacity = EconomyMath.autoClickerCapacity(d)
-	if d.autoClicker.charge >= capacity then
+	local now = os.time()
+	if state.activeUntil > now then
+		return -- already active
+	end
+	if state.readyAt > now then
+		fail(s, def.name .. " is recharging: " .. formatDuration(state.readyAt - now))
 		return
 	end
-	d.autoClicker.charge = capacity
+	local duration = math.ceil(EconomyMath.buffDuration(s.data, def))
+	state.activeUntil = now + duration
+	-- The cooldown starts when the buff ends.
+	state.readyAt = state.activeUntil + def.cooldown
 	changed(s)
-	notify(s, "Success", "Battery recharged!")
+	notify(s, "Success", string.format("%s! x%d on ALL stands for %ds", def.name, def.multiplier, duration))
 end
 
-local function onEvolution(s: Session, _station: StationDef, option: number)
+local function onEvolve(s: Session, perkId: string)
 	local d = s.data
+	local perk = Evolution.PERK_BY_ID[perkId]
+	if not perk then
+		return
+	end
 	if d.evolution.level >= Evolution.MAX_LEVEL then
 		fail(s, "You are fully evolved!")
 		return
@@ -387,31 +432,22 @@ local function onEvolution(s: Session, _station: StationDef, option: number)
 		fail(s, "Earn " .. (if requirement then NumberFormat.format(requirement) else "?") .. " this run to evolve!")
 		return
 	end
-	local perk = Evolution.PERKS[option]
-	if not perk then
-		return
-	end
-	-- Reset: wipe currency, Investors and run upgrades. Keep auto-clicker tier, statues and perks.
+	-- Reset: currency, stands, upgrades, managers and buff unlocks. Keep statues and perks.
 	d.currency = ZERO
 	d.lifetimeEarned = ZERO
-	d.investors = 0
-	d.clickLevel = 0
-	d.generators = {}
+	d.stands = EconomyMath.startingStands()
+	d.buffs = {}
+	table.clear(s.cycles)
 	d.evolution.level += 1
 	d.evolution.perks[perk.id] = (d.evolution.perks[perk.id] or 0) + 1
-	d.autoClicker.charge = EconomyMath.autoClickerCapacity(d)
 	s.evolveReadyNotified = false
 	changed(s)
-	notify(
-		s,
-		"Evolution",
-		string.format("Evolved to Level %d! All income x%s + %s", d.evolution.level, NumberFormat.format(EconomyMath.evolutionMultiplier(d.evolution.level)), perk.name)
-	)
+	notify(s, "Evolution", string.format("Evolved to Level %d! All income x%s + %s", d.evolution.level, NumberFormat.format(EconomyMath.evolutionMultiplier(d.evolution.level)), perk.name))
 	saveSoon(s)
 end
 
-local function onStatue(s: Session, station: StationDef, _option: number)
-	local def = Statues.BY_ID[station.target or ""]
+local function onStatue(s: Session, statueId: string)
+	local def = Statues.BY_ID[statueId]
 	local d = s.data
 	if not def or d.statues[def.id] then
 		return
@@ -423,21 +459,37 @@ local function onStatue(s: Session, station: StationDef, _option: number)
 	if trySpend(s, EconomyMath.statueCost(def)) then
 		d.statues[def.id] = true
 		changed(s)
-		notify(s, "Success", string.format("%s raised! %s income x%s forever!", def.name, def.source, NumberFormat.format(BigNumber.fromNumber(def.multiplier))))
+		local source = if def.source == "All" then "ALL" elseif Economy.STAND_BY_ID[def.source] then Economy.STAND_BY_ID[def.source].name else def.source
+		notify(s, "Success", string.format("%s raised! %s income x%s forever!", def.name, source, NumberFormat.format(BigNumber.fromNumber(def.multiplier))))
 		saveSoon(s)
 	end
 end
 
-local HANDLERS: { [Types.StationKind]: (Session, StationDef, number) -> () } = {
-	Clam = onClam,
-	Generator = onGenerator,
-	ClickUpgrade = onClickUpgrade,
-	Investor = onInvestor,
-	AutoClicker = onAutoClicker,
-	Battery = onBattery,
-	Evolution = onEvolution,
-	Statue = onStatue,
-}
+local function handle(s: Session, station: StationDef)
+	local kind = station.kind
+	local target = station.target or ""
+	if kind == "Buff" then
+		onBuff(s, target)
+	elseif kind == "Evolve" then
+		onEvolve(s, target)
+	elseif kind == "Statue" then
+		onStatue(s, target)
+	else
+		local def = Economy.STAND_BY_ID[target]
+		if not def then
+			return
+		end
+		if kind == "StandMain" then
+			onStandMain(s, def)
+		elseif kind == "Multiplier" then
+			onMultiplier(s, def)
+		elseif kind == "Speed" then
+			onSpeed(s, def)
+		elseif kind == "Manager" then
+			onManager(s, def)
+		end
+	end
+end
 
 -- ===== Tick =====
 
@@ -445,7 +497,7 @@ local function checkMilestones(s: Session)
 	local d = s.data
 	if not s.evolveReadyNotified and EconomyMath.canEvolve(d) then
 		s.evolveReadyNotified = true
-		notify(s, "Evolution", "You can EVOLVE! Visit the Evolution Altar.")
+		notify(s, "Evolution", "You can EVOLVE! Stand on a perk pad at the Evolution Temple.")
 		sendSnapshot(s)
 	end
 	if not s.stairwayNotified and EconomyMath.isStairwayUnlocked(d) then
@@ -459,33 +511,20 @@ local function tickSession(s: Session, now: number)
 	local dt = math.clamp(now - s.lastTick, 0, 5)
 	s.lastTick = now
 	local d = s.data
-	local income = BigNumber.mulNumber(s.passive, dt)
 
-	if s.autoCps > 0 then
-		if s.autoInfinite then
-			income = BigNumber.add(income, BigNumber.mulNumber(s.autoClickValue, s.autoCps * dt))
-		elseif d.autoClicker.charge > 0 then
-			s.autoClickRemainder += s.autoCps * dt
-			local whole = math.floor(s.autoClickRemainder)
-			s.autoClickRemainder -= whole
-			local clicks = math.min(whole, d.autoClicker.charge)
-			d.autoClicker.charge -= clicks
-			d.totalClicks += clicks
-			income = BigNumber.add(income, BigNumber.mulNumber(s.autoClickValue, clicks))
-			if d.autoClicker.charge <= 0 then
-				s.autoClickRemainder = 0
-				earn(s, income)
-				income = ZERO
-				changed(s)
-				notify(s, "Info", "Auto-Clicker battery empty! Recharge it at the Battery Dock.")
-			end
-		end
+	-- A buff started or ended since the last refresh: rates change.
+	if EconomyMath.activeBuffMultiplier(d, os.time()) ~= s.buff then
+		changed(s)
 	end
 
-	earn(s, income)
+	earn(s, BigNumber.mulNumber(s.rate, dt))
+	for _, def in Economy.STANDS do
+		completeCycle(s, def, now)
+	end
+
 	checkMilestones(s)
-	local currency, rate = d.currency, currentRate(s)
-	Net.get().Tick:FireClient(s.player, { currency.m, currency.e, rate.m, rate.e, Workspace:GetServerTimeNow(), d.autoClicker.charge })
+	local currency, rate = d.currency, s.rate
+	Net.get().Tick:FireClient(s.player, { currency.m, currency.e, rate.m, rate.e, Workspace:GetServerTimeNow(), s.buff })
 	updateLeaderstats(s)
 end
 
@@ -513,15 +552,6 @@ function EconomyService.init()
 	end)
 end
 
-local function formatDuration(seconds: number): string
-	local hours = seconds // 3600
-	local minutes = (seconds % 3600) // 60
-	if hours > 0 then
-		return string.format("%dh %dm", hours, minutes)
-	end
-	return string.format("%dm", minutes)
-end
-
 function EconomyService.startSession(player: Player, data: PlayerData, entitlements: Entitlements)
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name = "leaderstats"
@@ -538,12 +568,9 @@ function EconomyService.startSession(player: Player, data: PlayerData, entitleme
 		data = data,
 		entitlements = entitlements,
 		lastTick = os.clock(),
-		autoClickRemainder = 0,
-		passive = ZERO,
-		clickValue = ZERO,
-		autoClickValue = ZERO,
-		autoCps = 0,
-		autoInfinite = false,
+		buff = 1,
+		rate = ZERO,
+		cycles = {},
 		evolveReadyNotified = EconomyMath.canEvolve(data),
 		stairwayNotified = EconomyMath.isStairwayUnlocked(data),
 		lastErrorAt = 0,
@@ -559,7 +586,7 @@ function EconomyService.startSession(player: Player, data: PlayerData, entitleme
 		if earned.m > 0 then
 			earn(s, earned)
 			local capped = math.min(away, EconomyMath.offlineCapSeconds(data))
-			notify(s, "Offline", "Welcome back! Your ocean earned this while you were away (" .. formatDuration(capped) .. ")", earned)
+			notify(s, "Offline", "Welcome back! Your managers earned this while you were away (" .. formatDuration(capped) .. ")", earned)
 		end
 	end
 
@@ -580,12 +607,11 @@ function EconomyService.isActive(player: Player): boolean
 	return sessions[player] ~= nil
 end
 
-function EconomyService.handleAction(player: Player, station: StationDef, option: number)
+function EconomyService.handleAction(player: Player, station: StationDef)
 	local s = sessions[player]
-	if not s then
-		return
+	if s then
+		handle(s, station)
 	end
-	HANDLERS[station.kind](s, station, option)
 end
 
 function EconomyService.resync(player: Player)
@@ -603,20 +629,36 @@ function EconomyService.setEntitlements(player: Player, entitlements: Entitlemen
 	end
 end
 
--- Developer product grant. Always succeeds for a loaded player. Returns false if not loaded.
-function EconomyService.grantBatteryOvercharge(player: Player): boolean
+-- Developer/testing grant (DevService) and developer-product grants. Counts as earned income.
+function EconomyService.grantCurrency(player: Player, amount: BigNumber): boolean
+	local s = sessions[player]
+	if not s or amount.m <= 0 then
+		return false
+	end
+	earn(s, amount)
+	checkMilestones(s)
+	changed(s)
+	return true
+end
+
+-- Time Warp product: TIME_WARP_SECONDS of managed income, or of the best owned stand if none is managed.
+function EconomyService.grantTimeWarp(player: Player): boolean
 	local s = sessions[player]
 	if not s then
 		return false
 	end
-	local d = s.data
-	if d.autoClicker.tier == 0 then
-		d.autoClicker.tier = 1
+	local rate = EconomyMath.managedRate(s.data, mods(), s.entitlements, 1)
+	if rate.m <= 0 then
+		for _, def in Economy.STANDS do
+			if EconomyMath.isOwned(s.data, def.id) then
+				rate = BigNumber.max(rate, EconomyMath.standRate(s.data, def, mods(), s.entitlements, 1))
+			end
+		end
 	end
-	local capacity = EconomyMath.autoClickerCapacity(d)
-	d.autoClicker.charge = math.min(LIMITS.maxCharge, math.max(d.autoClicker.charge, capacity * Monetization.OVERCHARGE_MULTIPLIER))
+	local amount = BigNumber.mulNumber(rate, Economy.TIME_WARP_SECONDS)
+	earn(s, amount)
 	changed(s)
-	notify(s, "Success", "Battery OVERCHARGED! Thanks for your support!")
+	notify(s, "Success", "Time Warp! Thanks for your support!", amount)
 	return true
 end
 
