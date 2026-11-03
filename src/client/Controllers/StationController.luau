@@ -46,6 +46,10 @@ local evolveSent = false
 local lastSent: { [string]: number } = {}
 
 StationController.nearestChanged = Signal.new() :: Signal.Signal<StationDef?>
+-- Fired whenever the player activates a pad (stepping on it or pressing E), for visual feedback.
+StationController.stepped = Signal.new() :: Signal.Signal<StationDef>
+-- Fired when the player activates the Shell Shop pad (client-only: opens the shop panel).
+StationController.shopRequested = Signal.new() :: Signal.Signal<StationDef>
 
 local function rootPosition(): Vector3?
 	local character = player.Character
@@ -72,12 +76,16 @@ local function isRunPad(station: StationDef): boolean
 	end
 	local snap = StateController.snapshot()
 	local stand = snap and snap.stands[station.target or ""]
-	return stand ~= nil and stand.owned and not stand.managed
+	return stand ~= nil and stand.owned and not stand.managed and not stand.autoCollected
 end
 
 local function trigger(station: StationDef)
+	StationController.stepped:Fire(station)
 	if station.kind == "Evolve" then
 		return -- evolving needs the hold-to-confirm on the pad
+	elseif station.kind == "Shop" then
+		StationController.shopRequested:Fire(station)
+		return -- purchases go through Roblox prompts, never through the Action remote
 	end
 	send(station, ACTION_INTERVAL)
 end

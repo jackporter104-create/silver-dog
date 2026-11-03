@@ -1,17 +1,16 @@
 --!strict
 --[[
-	WorldController: per-player 3D presentation on top of the server-built world.
+	WorldController: client-side life for the server-built world. No 3D text anywhere.
 
-	  * Own zone and Hub pads: an info row on each pad's sign (price, level, cooldown) at 4 Hz.
-	    Pads appear and disappear as the server reveals them, so rows attach on ChildAdded.
-	    Other players' pads keep only their server title: prices stay private.
-	  * Own stands: a progress bar over each counter and "+value" pops when a cycle pays out,
-	    plus the stand's income on its sign.
-	  * Every zone: manager NPCs (tagged by the server) play a looping work animation locally,
-	    with distance LOD. Newly bought structures get a sparkle burst.
-	  * Golden statues on the player's own statue pads, and the Heavenly Stairway barrier opening.
-	Character physics are client-owned, so opening the barrier locally lets the player pass.
-	Statue purchases are still validated by the server.
+	  * Animator: every Model tagged "OceanAnim" (clam lids, gears, corals, kelp, tentacles, pearls,
+	    pad icons, flags) moves with one Workspace:BulkMoveTo per frame, with distance LOD.
+	  * Managers (tag "OceanManager"): exaggerated idle with a bouncy walk-in-place, waving arms and
+	    a spinning hop every few seconds.
+	  * Glow (tag "OceanGlow"): TweenService loops pulse lights and neon parts.
+	  * Juice: pads squish when stepped on, coins burst from your stands on every payout, and new
+	    businesses (anyone's) appear with sparkles, bubbles and a highlight flash.
+	  * Own reef: buff pads dim while recharging. Statues and the stairway barrier follow the snapshot.
+	All of this is local: the server never replicates per-frame motion.
 ]]
 
 local CollectionService = game:GetService("CollectionService")
@@ -22,233 +21,172 @@ local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
-local BigNumber = require(Shared.BigNumber)
-local NumberFormat = require(Shared.NumberFormat)
 local Types = require(Shared.Types)
 local Economy = require(Shared.Config.Economy)
 local Stations = require(Shared.Config.Stations)
 local Statues = require(Shared.Config.Statues)
 
 local StateController = require(script.Parent.StateController)
+local StationController = require(script.Parent.StationController)
+local StandTracker = require(script.Parent.StandTracker)
 
 type StationDef = Stations.StationDef
-type BigNumber = BigNumber.BigNumber
 
 local WorldController = {}
 
-local MANAGER_TAG = "OceanManager" -- must match ArenaService.MANAGER_TAG
+-- Must match ArenaService.ANIM_TAG / GLOW_TAG / MANAGER_TAG.
+local ANIM_TAG = "OceanAnim"
+local GLOW_TAG = "OceanGlow"
+local MANAGER_TAG = "OceanManager"
 
-type Label = { station: StationDef, text: TextLabel, parts: { BasePart } }
-type StandVisual = {
-	standId: string,
+local NEAR_DISTANCE = 70
+local FAR_DISTANCE = 180 -- beyond this nothing animates
+local SPARKLE_TEXTURE = "rbxasset://textures/particles/sparkles_main.dds"
+local GOLD = Color3.fromRGB(255, 200, 60)
+
+type Animated = {
 	model: Model,
-	sign: TextLabel?,
-	fill: Frame?,
-	barGui: BillboardGui?,
-	counter: BasePart?,
-	cycleStart: number?,
-	cycleEnd: number?,
-	cycleValue: BigNumber?,
-	loopPhase: number, -- managed stands: server-time origin of the visual loop
+	kind: string,
+	speed: number,
+	amp: number,
+	phase: number,
+	pivot: CFrame,
+	parts: { BasePart },
+	offsets: { CFrame },
+	arms: { [number]: boolean }?, -- managers only
 }
-type Npc = { model: Model, parts: { BasePart }, offsets: { CFrame }, arms: { [number]: boolean }, root: CFrame, phase: number }
 
 local player = Players.LocalPlayer
-local labels: { [Instance]: Label } = {}
-local stands: { [string]: StandVisual } = {}
-local npcs: { [Model]: Npc } = {}
+local animated: { [Model]: Animated } = {}
+local ownPads: { [string]: Model } = {}
+local ownStands: { [string]: Model } = {}
+local coinEmitters: { [Model]: ParticleEmitter } = {}
 local builtStatues: { [string]: Model } = {}
 local zoneConnections: { RBXScriptConnection } = {}
 local visuals: Folder
-local popupCount = 0
 local attachedAt = math.huge
+local frame = 0
 
-local AFFORDABLE = Color3.fromRGB(110, 255, 160)
-local NORMAL = Color3.fromRGB(255, 255, 255)
-local LOCKED = Color3.fromRGB(160, 170, 185)
-local ACTIVE = Color3.fromRGB(255, 220, 90)
-local MAX_POPUPS = 10
-local MIN_POP_INTERVAL = 0.8 -- managed stands faster than this show a steady bar instead of pops
-local NPC_ANIMATE_DISTANCE = 160
+-- ===== Animator =====
 
-local function fmt(x: BigNumber): string
-	return NumberFormat.format(x)
-end
-
-local function secondsText(seconds: number): string
-	seconds = math.ceil(seconds)
-	if seconds >= 60 then
-		return string.format("%dm %02ds", seconds // 60, seconds % 60)
-	end
-	return seconds .. "s"
-end
-
-local function setDim(parts: { BasePart }, amount: number)
-	for _, p in parts do
-		p.LocalTransparencyModifier = amount
-	end
-end
-
-local function infoRow(title: BillboardGui): TextLabel
-	local existing = title:FindFirstChild("Info")
-	if existing and existing:IsA("TextLabel") then
-		return existing
-	end
-	local text = Instance.new("TextLabel")
-	text.Name = "Info"
-	text.Position = UDim2.fromScale(0, 0.6)
-	text.Size = UDim2.fromScale(1, 0.4)
-	text.BackgroundTransparency = 1
-	text.Font = Enum.Font.FredokaOne
-	text.TextScaled = true
-	text.TextStrokeTransparency = 0.3
-	text.TextColor3 = NORMAL
-	text.Text = ""
-	text.Parent = title
-	return text
-end
-
-local function modelParts(model: Instance): { BasePart }
+local function capture(model: Model, kind: string, speed: number, amp: number, phase: number, collectArms: boolean): Animated
+	local stored = model:GetAttribute("AnimPivot")
+	local pivot = if typeof(stored) == "CFrame" then stored else model:GetPivot()
 	local parts: { BasePart } = {}
+	local offsets: { CFrame } = {}
+	local arms: { [number]: boolean }? = if collectArms then {} else nil
 	for _, d in model:GetDescendants() do
 		if d:IsA("BasePart") then
 			table.insert(parts, d)
+			table.insert(offsets, pivot:ToObjectSpace(d.CFrame))
+			if arms and d.Name == "Arm" then
+				arms[#parts] = true
+			end
 		end
 	end
-	return parts
+	return { model = model, kind = kind, speed = speed, amp = amp, phase = phase, pivot = pivot, parts = parts, offsets = offsets, arms = arms }
 end
 
--- ===== Popups, progress, sparkles =====
+local function numberAttribute(instance: Instance, name: string, fallback: number): number
+	local value = instance:GetAttribute(name)
+	return if typeof(value) == "number" then value else fallback
+end
 
-local function popup(adornee: BasePart, text: string)
-	if popupCount >= MAX_POPUPS then
+local function trackAnimated(instance: Instance)
+	if not instance:IsA("Model") or animated[instance] then
 		return
 	end
-	popupCount += 1
-	local gui = Instance.new("BillboardGui")
-	gui.Size = UDim2.fromOffset(160, 36)
-	gui.StudsOffsetWorldSpace = Vector3.new(math.random(-10, 10) / 10, 4, 0)
-	gui.MaxDistance = 60
-	gui.LightInfluence = 0
-	gui.Adornee = adornee
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.fromScale(1, 1)
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.FredokaOne
-	label.TextScaled = true
-	label.TextColor3 = ACTIVE
-	label.TextStrokeTransparency = 0.3
-	label.Text = text
-	label.Parent = gui
-	gui.Parent = visuals
-	TweenService:Create(gui, TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffsetWorldSpace = gui.StudsOffsetWorldSpace + Vector3.new(0, 3, 0) }):Play()
-	local fade = TweenService:Create(label, TweenInfo.new(0.9), { TextTransparency = 1, TextStrokeTransparency = 1 })
-	fade:Play()
-	fade.Completed:Connect(function()
-		gui:Destroy()
-		popupCount -= 1
+	-- Parts replicate right after the model; wait a frame so the capture sees all of them.
+	task.defer(function()
+		if not instance.Parent then
+			return
+		end
+		local kind = instance:GetAttribute("Anim")
+		animated[instance] = capture(
+			instance,
+			if typeof(kind) == "string" then kind else "Float",
+			numberAttribute(instance, "AnimSpeed", 1),
+			numberAttribute(instance, "AnimAmp", 0),
+			numberAttribute(instance, "AnimPhase", 0),
+			false
+		)
 	end)
 end
 
-local function sparkle(position: Vector3, color: Color3)
-	local anchor = Instance.new("Part")
-	anchor.Anchored = true
-	anchor.CanCollide = false
-	anchor.CanQuery = false
-	anchor.CanTouch = false
-	anchor.Transparency = 1
-	anchor.Size = Vector3.new(1, 1, 1)
-	anchor.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
-	local emitter = Instance.new("ParticleEmitter")
-	emitter.Rate = 0
-	emitter.Lifetime = NumberRange.new(0.8, 1.4)
-	emitter.Speed = NumberRange.new(8, 16)
-	emitter.SpreadAngle = Vector2.new(180, 180)
-	emitter.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.8), NumberSequenceKeypoint.new(1, 0) })
-	emitter.Color = ColorSequence.new(color, Color3.new(1, 1, 1))
-	emitter.LightEmission = 0.8
-	emitter.Parent = anchor
-	anchor.Parent = visuals
-	emitter:Emit(40)
-	task.delay(2, function()
-		anchor:Destroy()
+local function trackManager(instance: Instance)
+	if not instance:IsA("Model") or animated[instance] then
+		return
+	end
+	task.defer(function()
+		if instance.Parent then
+			animated[instance] = capture(instance, "Manager", 1, 0, math.random() * 4, true)
+		end
 	end)
 end
 
-local function makeBar(counter: BasePart): (BillboardGui, Frame)
-	local gui = Instance.new("BillboardGui")
-	gui.Name = "Progress"
-	gui.Size = UDim2.fromOffset(120, 14)
-	gui.StudsOffsetWorldSpace = Vector3.new(0, 3.2, 0)
-	gui.MaxDistance = 70
-	gui.LightInfluence = 0
-	gui.Adornee = counter
-	gui.Enabled = false
-	local track = Instance.new("Frame")
-	track.Size = UDim2.fromScale(1, 1)
-	track.BackgroundColor3 = Color3.fromRGB(10, 40, 70)
-	track.BorderSizePixel = 0
-	track.Parent = gui
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0.5, 0)
-	corner.Parent = track
-	local fill = Instance.new("Frame")
-	fill.Size = UDim2.fromScale(0, 1)
-	fill.BackgroundColor3 = ACTIVE
-	fill.BorderSizePixel = 0
-	fill.Parent = track
-	local fillCorner = Instance.new("UICorner")
-	fillCorner.CornerRadius = UDim.new(0.5, 0)
-	fillCorner.Parent = fill
-	gui.Parent = visuals
-	return gui, fill
+local function untrack(instance: Instance)
+	if instance:IsA("Model") then
+		animated[instance] = nil
+	end
 end
 
--- ===== Manager NPCs (every zone) =====
-
-local function trackNpc(instance: Instance)
-	if not instance:IsA("Model") or npcs[instance] then
-		return
+-- Transform of the pivot for one animation kind at time t.
+local function pose(a: Animated, t: number): CFrame
+	local kind, speed, amp, phase = a.kind, a.speed, a.amp, a.phase
+	local wave = t * speed + phase
+	if kind == "Hinge" then
+		return CFrame.Angles(math.rad(amp) * math.sin(wave), 0, 0)
+	elseif kind == "Spin" then
+		return CFrame.Angles(0, wave, 0)
+	elseif kind == "Sway" then
+		return CFrame.Angles(math.rad(amp) * math.sin(wave), 0, math.rad(amp * 0.7) * math.sin(wave * 0.8 + 1.3))
+	elseif kind == "Bounce" then
+		return CFrame.new(0, amp * math.abs(math.sin(wave)), 0)
+	elseif kind == "Float" then
+		return CFrame.new(0, amp * math.sin(wave), 0) * CFrame.Angles(0, t * 0.9 + phase, 0)
+	elseif kind == "Manager" then
+		-- Bouncy idle, a lean from side to side, and every 4 s a big spinning hop.
+		local cycle = (t + phase) % 4
+		local hop = if cycle < 0.7 then cycle / 0.7 else 0
+		local height = math.abs(math.sin(t * 5 + phase)) * 0.45 + math.sin(math.pi * hop) * 2.6
+		local spin = if hop > 0 then (1 - math.cos(math.pi * hop)) * math.pi else 0
+		return CFrame.new(0, height, 0) * CFrame.Angles(0, spin + math.sin(t * 1.6 + phase) * 0.3, math.sin(t * 2.5 + phase) * 0.18)
 	end
-	local root = instance:GetPivot()
-	local parts: { BasePart } = {}
-	local offsets: { CFrame } = {}
-	local arms: { [number]: boolean } = {}
-	for _, p in modelParts(instance) do
-		table.insert(parts, p)
-		table.insert(offsets, root:ToObjectSpace(p.CFrame))
-		if p.Name == "Arm" then
-			arms[#parts] = true
-		end
-	end
-	npcs[instance] = { model = instance, parts = parts, offsets = offsets, arms = arms, root = root, phase = math.random() * 6 }
+	return CFrame.identity
 end
 
 local bulkParts: { BasePart } = {}
 local bulkCFrames: { CFrame } = {}
 
--- Looping "work" animation: a bounce and sway, with arms or claws scooping in front.
-local function animateNpcs()
+local function animateAll()
+	frame += 1
 	local camera = Workspace.CurrentCamera
 	local cameraPosition = if camera then camera.CFrame.Position else Vector3.zero
 	local t = os.clock()
 	table.clear(bulkParts)
 	table.clear(bulkCFrames)
-	for model, npc in npcs do
+	local index = 0
+	for model, a in animated do
+		index += 1
 		if not model.Parent then
-			npcs[model] = nil
+			animated[model] = nil
 			continue
 		end
-		if (npc.root.Position - cameraPosition).Magnitude > NPC_ANIMATE_DISTANCE then
+		local distance = (a.pivot.Position - cameraPosition).Magnitude
+		if distance > FAR_DISTANCE then
 			continue
 		end
-		local bounce = math.abs(math.sin(t * 4 + npc.phase)) * 0.35
-		local root = npc.root * CFrame.new(0, bounce, 0) * CFrame.Angles(0, math.sin(t * 1.5 + npc.phase) * 0.25, 0)
-		local scoop = math.sin(t * 6 + npc.phase) * 0.6
-		for i, p in npc.parts do
-			local cf = root * npc.offsets[i]
-			if npc.arms[i] then
-				cf *= CFrame.Angles(scoop, 0, 0)
+		-- Distance LOD: far animations update every third frame.
+		if distance > NEAR_DISTANCE and (frame + index) % 3 ~= 0 then
+			continue
+		end
+		local root = a.pivot * pose(a, t)
+		local arms = a.arms
+		local armSwing = if arms then CFrame.Angles(math.sin(t * 7 + a.phase) * 0.9, 0, 0) else nil
+		for i, p in a.parts do
+			local cf = root * a.offsets[i]
+			if arms and armSwing and arms[i] then
+				cf *= armSwing
 			end
 			table.insert(bulkParts, p)
 			table.insert(bulkCFrames, cf)
@@ -259,163 +197,167 @@ local function animateNpcs()
 	end
 end
 
--- ===== Labels =====
+-- ===== Glow (TweenService loops) =====
 
-local function stationText(station: StationDef, snap: Types.Snapshot, currency: BigNumber): (string, Color3)
-	local view = snap.stations[station.id]
-	if not view then
-		return "", NORMAL
+local function startGlow(instance: Instance)
+	local period = instance:GetAttribute("GlowPeriod")
+	local duration = if typeof(period) == "number" then period / 2 else 1.2
+	local info = TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, math.random() * duration)
+	if instance:IsA("PointLight") then
+		TweenService:Create(instance, info, { Brightness = instance.Brightness * 0.45 }):Play()
+	elseif instance:IsA("BasePart") then
+		TweenService:Create(instance, info, { Transparency = math.min(instance.Transparency + 0.35, 1) }):Play()
 	end
-	local kind = station.kind
-	local function priced(prefix: string): (string, Color3)
-		local cost = StateController.big(view.cost)
-		return prefix .. fmt(cost), if BigNumber.gte(currency, cost) then AFFORDABLE else NORMAL
-	end
-	if kind == "Deed" then
-		return priced("Unlock: ")
-	elseif kind == "StandMain" then
-		local stand = snap.stands[station.target or ""]
-		if stand and stand.managed then
-			return "Managed", AFFORDABLE
-		end
-		return "Stand here to run!", ACTIVE
-	elseif kind == "Buff" then
-		local buff = snap.buffs[station.target or ""]
-		if not buff then
-			return "", NORMAL
-		end
-		local active = StateController.remaining(buff.activeRemaining)
-		if active > 0 then
-			return "ACTIVE " .. secondsText(active), ACTIVE
-		end
-		local cooldown = StateController.remaining(buff.cooldownRemaining)
-		if cooldown > 0 then
-			return "Recharging " .. secondsText(cooldown), LOCKED
-		end
-		local def = Economy.BUFF_BY_ID[station.target or ""]
-		return if def then "Ready! x" .. def.multiplier else "Ready!", AFFORDABLE
-	elseif kind == "Evolve" then
-		if view.maxed then
-			return "Fully evolved", AFFORDABLE
-		elseif view.locked then
-			return view.lockReason or "Locked", LOCKED
-		end
-		return "Stand here 2s to evolve", ACTIVE
-	end
-	if view.maxed then
-		if kind == "Manager" then
-			return "Hired!", AFFORDABLE
-		elseif kind == "Statue" then
-			return "Raised!", AFFORDABLE
-		end
-		return "MAX", AFFORDABLE
-	elseif view.locked then
-		return "Locked", LOCKED
-	elseif kind == "Multiplier" then
-		return priced("x" .. fmt(BigNumber.pow(BigNumber.fromNumber(2), view.level + 1)) .. ": ")
-	elseif kind == "Speed" then
-		return priced("x" .. 2 ^ (view.level + 1) .. ": ")
-	end
-	return priced("")
 end
 
-local function refreshLabels()
-	local snap = StateController.snapshot()
-	if not snap then
-		return
+-- ===== Juice =====
+
+local function burst(position: Vector3, color: Color3, count: number, texture: string?, upward: boolean?)
+	local anchor = Instance.new("Part")
+	anchor.Anchored = true
+	anchor.CanCollide = false
+	anchor.CanQuery = false
+	anchor.CanTouch = false
+	anchor.Transparency = 1
+	anchor.Size = Vector3.new(1, 1, 1)
+	anchor.CFrame = CFrame.new(position)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.Lifetime = NumberRange.new(0.8, 1.4)
+	e.Speed = NumberRange.new(8, 16)
+	e.SpreadAngle = if upward then Vector2.new(35, 35) else Vector2.new(180, 180)
+	e.Acceleration = if upward then Vector3.new(0, -25, 0) else Vector3.zero
+	e.EmissionDirection = Enum.NormalId.Top
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.9), NumberSequenceKeypoint.new(1, 0) })
+	e.Color = ColorSequence.new(color, Color3.new(1, 1, 1))
+	e.LightEmission = 0.8
+	if texture then
+		e.Texture = texture
 	end
-	local currency = StateController.displayCurrency()
-	for model, label in labels do
+	e.Parent = anchor
+	anchor.Parent = visuals
+	e:Emit(count)
+	task.delay(2, function()
+		anchor:Destroy()
+	end)
+end
+
+-- A reusable gold-coin fountain above one of the player's stands.
+local function coinEmitter(model: Model): ParticleEmitter?
+	local existing = coinEmitters[model]
+	if existing and existing.Parent then
+		return existing
+	end
+	local base = model.PrimaryPart
+	if not base then
+		return nil
+	end
+	local anchor = Instance.new("Part")
+	anchor.Anchored = true
+	anchor.CanCollide = false
+	anchor.CanQuery = false
+	anchor.CanTouch = false
+	anchor.Transparency = 1
+	anchor.Size = Vector3.new(2, 1, 2)
+	anchor.CFrame = base.CFrame * CFrame.new(0, 7, 0)
+	local e = Instance.new("ParticleEmitter")
+	e.Rate = 0
+	e.Lifetime = NumberRange.new(0.9, 1.3)
+	e.Speed = NumberRange.new(10, 16)
+	e.SpreadAngle = Vector2.new(30, 30)
+	e.EmissionDirection = Enum.NormalId.Top
+	e.Acceleration = Vector3.new(0, -35, 0)
+	e.RotSpeed = NumberRange.new(-180, 180)
+	e.Size = NumberSequence.new(0.7)
+	e.Color = ColorSequence.new(GOLD)
+	e.LightEmission = 0.4
+	e.Parent = anchor
+	anchor.Parent = visuals
+	coinEmitters[model] = e
+	model.AncestryChanged:Connect(function()
 		if not model.Parent then
-			labels[model] = nil
-			continue
+			anchor:Destroy()
+			coinEmitters[model] = nil
 		end
-		local text, color = stationText(label.station, snap, currency)
-		label.text.Text = text
-		label.text.TextColor3 = color
-		local dim = 0
-		if label.station.kind == "Buff" then
-			local buff = snap.buffs[label.station.target or ""]
-			if buff and StateController.remaining(buff.activeRemaining) <= 0 and StateController.remaining(buff.cooldownRemaining) > 0 then
-				dim = 0.5
-			end
-		end
-		setDim(label.parts, dim)
-	end
-	for standId, visual in stands do
-		if not visual.model.Parent then
-			if visual.barGui then
-				visual.barGui:Destroy()
-			end
-			stands[standId] = nil
-			continue
-		end
-		local stand = snap.stands[standId]
-		if stand and visual.sign then
-			local rate = StateController.big(stand.rate)
-			visual.sign.Text = (if stand.managed then "" else "By hand: ") .. NumberFormat.formatRate(rate)
-			visual.sign.TextColor3 = if stand.managed then AFFORDABLE else ACTIVE
-		end
+	end)
+	return e
+end
+
+local function onPayout(payout: StandTracker.Payout)
+	local model = ownStands[payout.standId]
+	local e = model and coinEmitter(model)
+	if e then
+		e:Emit(6)
 	end
 end
 
--- ===== Stand progress (own zone) =====
+local function pressPad(station: StationDef)
+	local model: Model? = ownPads[station.id]
+	if not model then
+		local arena = Workspace:FindFirstChild("OceanArena")
+		local hub = arena and arena:FindFirstChild("Hub")
+		local hubStations = hub and hub:FindFirstChild("Stations")
+		local found = hubStations and hubStations:FindFirstChild(station.id)
+		model = if found and found:IsA("Model") then found else nil
+	end
+	local inlay = model and model:FindFirstChild("Inlay")
+	if not inlay or not inlay:IsA("BasePart") then
+		return
+	end
+	local rest = inlay.CFrame
+	inlay.CFrame = rest * CFrame.new(-0.12, 0, 0) -- cylinders run along X: local -X is down
+	TweenService:Create(inlay, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { CFrame = rest }):Play()
+	burst(rest.Position + Vector3.new(0, 0.5, 0), station.color, 12, SPARKLE_TEXTURE, true)
+end
 
-local function updateProgress()
+-- Sparkles, bubbles and a highlight flash when any business appears (skipped on join).
+local function celebrate(model: Model)
+	if os.clock() - attachedAt < 3 then
+		return
+	end
+	local plot = Stations.PLOT_BY_STAND[model.Name]
+	local color = if plot then plot.color else Color3.new(1, 1, 1)
+	local pivot = model:GetPivot().Position
+	burst(pivot + Vector3.new(0, 4, 0), color, 40, SPARKLE_TEXTURE)
+	burst(pivot + Vector3.new(0, 1, 0), Color3.fromRGB(210, 240, 255), 25, nil, true)
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = color
+	highlight.OutlineColor = Color3.new(1, 1, 1)
+	highlight.FillTransparency = 0.2
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+	highlight.Adornee = model
+	highlight.Parent = visuals
+	local fade = TweenService:Create(highlight, TweenInfo.new(1.6, Enum.EasingStyle.Quad), { FillTransparency = 1, OutlineTransparency = 1 })
+	fade:Play()
+	fade.Completed:Connect(function()
+		highlight:Destroy()
+	end)
+end
+
+-- ===== Own reef state =====
+
+local function refreshPads()
 	local snap = StateController.snapshot()
 	if not snap then
 		return
 	end
-	local now = Workspace:GetServerTimeNow()
-	for standId, visual in stands do
-		local stand = snap.stands[standId]
-		local gui, fill, counter = visual.barGui, visual.fill, visual.counter
-		if not stand or not gui or not fill or not counter then
+	for id, model in ownPads do
+		if not model.Parent then
+			ownPads[id] = nil
 			continue
 		end
-		if stand.owned and stand.managed then
-			gui.Enabled = true
-			local interval = stand.interval
-			if interval < MIN_POP_INTERVAL then
-				fill.Size = UDim2.fromScale(1, 1)
-			else
-				local progress = ((now - visual.loopPhase) % interval) / interval
-				local previous = fill.Size.X.Scale
-				fill.Size = UDim2.fromScale(progress, 1)
-				if progress < previous then
-					popup(counter, "+" .. fmt(StateController.big(stand.cycleValue)))
+		local station = Stations.BY_ID[id]
+		if station and station.kind == "Buff" then
+			local buff = snap.buffs[station.target or ""]
+			local recharging = buff ~= nil and StateController.remaining(buff.activeRemaining) <= 0 and StateController.remaining(buff.cooldownRemaining) > 0
+			for _, d in model:GetDescendants() do
+				if d:IsA("BasePart") then
+					d.LocalTransparencyModifier = if recharging then 0.55 else 0
 				end
 			end
-		elseif visual.cycleStart and visual.cycleEnd then
-			gui.Enabled = true
-			local start, finish = visual.cycleStart :: number, visual.cycleEnd :: number
-			local progress = math.clamp((now - start) / math.max(finish - start, 1e-3), 0, 1)
-			fill.Size = UDim2.fromScale(progress, 1)
-			if progress >= 1 then
-				local value = visual.cycleValue
-				if value then
-					popup(counter, "+" .. fmt(value))
-				end
-				visual.cycleStart, visual.cycleEnd, visual.cycleValue = nil, nil, nil
-			end
-		else
-			gui.Enabled = stand.owned
-			fill.Size = UDim2.fromScale(0, 1)
 		end
 	end
-end
-
-local function onCycle(event: Types.CycleEvent)
-	local visual = stands[event.standId]
-	local snap = StateController.snapshot()
-	local stand = snap and snap.stands[event.standId]
-	if not visual or not stand then
-		return
-	end
-	local interval = math.max(stand.interval, Economy.MIN_MANUAL_INTERVAL)
-	visual.cycleStart = event.endsAt - interval
-	visual.cycleEnd = event.endsAt
-	visual.cycleValue = StateController.big(event.value)
 end
 
 -- ===== Statues & stairway =====
@@ -424,7 +366,7 @@ local function buildStatue(statueId: string, position: Vector3): Model
 	local model = Instance.new("Model")
 	model.Name = "Statue_" .. statueId
 	local gold = Color3.fromRGB(255, 205, 90)
-	local function add(size: Vector3, cframe: CFrame, shape: Enum.PartType?, material: Enum.Material?)
+	local function add(size: Vector3, cframe: CFrame, shape: Enum.PartType?, material: Enum.Material?): Part
 		local p = Instance.new("Part")
 		p.Anchored = true
 		p.CanCollide = false
@@ -437,21 +379,23 @@ local function buildStatue(statueId: string, position: Vector3): Model
 		p.Material = material or Enum.Material.Foil
 		p.Color = gold
 		p.Parent = model
+		return p
 	end
 	-- Pedestal sits on the pad inlay (top at +0.55).
 	local base = CFrame.new(position + Vector3.new(0, 0.55, 0))
 	add(Vector3.new(4.4, 2, 4.4), base * CFrame.new(0, 1, 0), nil, Enum.Material.Marble)
 	-- A leaping golden fish.
-	add(Vector3.new(4, 4, 4), base * CFrame.new(0, 6.3, 0), Enum.PartType.Ball)
+	local body = add(Vector3.new(4, 4, 4), base * CFrame.new(0, 6.3, 0), Enum.PartType.Ball)
 	add(Vector3.new(3, 3, 3), base * CFrame.new(0, 8.8, -1.5), Enum.PartType.Ball)
 	add(Vector3.new(1, 4, 3), base * CFrame.new(0, 3.3, 2) * CFrame.Angles(math.rad(35), 0, 0))
 	add(Vector3.new(0.6, 2, 2), base * CFrame.new(1.8, 6.3, 0) * CFrame.Angles(0, 0, math.rad(25)))
 	add(Vector3.new(0.6, 2, 2), base * CFrame.new(-1.8, 6.3, 0) * CFrame.Angles(0, 0, math.rad(-25)))
-	local glow = Instance.new("PointLight")
-	glow.Color = gold
-	glow.Range = 16
-	glow.Brightness = 2
-	glow.Parent = model:FindFirstChildWhichIsA("BasePart")
+	local light = Instance.new("PointLight")
+	light.Color = gold
+	light.Range = 16
+	light.Brightness = 2
+	light.Parent = body
+	startGlow(light)
 	model.Parent = visuals
 	return model
 end
@@ -461,14 +405,15 @@ local function onSnapshot(snap: Types.Snapshot)
 		if snap.statues[statue.id] and not builtStatues[statue.id] then
 			local station = Stations.BY_ID["Statue_" .. statue.id]
 			if station then
-				builtStatues[statue.id] = buildStatue(statue.id, station.position)
+				local model = buildStatue(statue.id, station.position)
+				builtStatues[statue.id] = model
+				celebrate(model)
 			end
 		elseif not snap.statues[statue.id] and builtStatues[statue.id] then
 			builtStatues[statue.id]:Destroy()
 			builtStatues[statue.id] = nil
 		end
 	end
-
 	local arena = Workspace:FindFirstChild("OceanArena")
 	local hub = arena and arena:FindFirstChild("Hub")
 	local stairway = hub and hub:FindFirstChild("HeavenlyStairway")
@@ -479,74 +424,21 @@ local function onSnapshot(snap: Types.Snapshot)
 			TweenService:Create(barrier, TweenInfo.new(1.5), { Transparency = 1 }):Play()
 		end
 		barrier.CanCollide = not open
-		local title = barrier:FindFirstChild("Title")
-		if title and title:IsA("BillboardGui") then
-			title.Enabled = not open
-		end
 	end
-	refreshLabels()
+	refreshPads()
 end
 
 -- ===== Attaching to server-built instances =====
 
-local function attachPad(model: Instance)
-	local station = Stations.BY_ID[model.Name]
-	if not station or labels[model] then
-		return
-	end
-	task.spawn(function()
-		local title: Instance? = nil
-		if station.kind == "Deed" then
-			local orb = model:WaitForChild("Orb", 10)
-			title = orb and orb:WaitForChild("Title", 10)
-		else
-			local pad = model:WaitForChild("Pad", 10)
-			title = pad and pad:WaitForChild("Title", 10)
-		end
-		if title and title:IsA("BillboardGui") and model.Parent then
-			labels[model] = { station = station, text = infoRow(title), parts = modelParts(model) }
-			refreshLabels()
-		end
-	end)
-end
-
-local function attachStand(model: Instance)
-	if not model:IsA("Model") or not Economy.STAND_BY_ID[model.Name] then
-		return
-	end
-	task.spawn(function()
-		local post = model:WaitForChild("SignPost", 10)
-		local title = post and post:WaitForChild("Title", 10)
-		local counter = model:WaitForChild("Counter", 10)
-		if not model.Parent then
-			return
-		end
-		local visual: StandVisual = {
-			standId = model.Name,
-			model = model,
-			sign = if title and title:IsA("BillboardGui") then infoRow(title) else nil,
-			counter = if counter and counter:IsA("BasePart") then counter else nil,
-			loopPhase = Workspace:GetServerTimeNow(),
-		}
-		if visual.counter then
-			visual.barGui, visual.fill = makeBar(visual.counter)
-		end
-		stands[model.Name] = visual
-	end)
-end
-
--- Sparkle when any player's new structure appears (skipped for what already exists on join).
-local function watchStructures(zones: Instance)
+local function watchZones(zones: Instance)
 	local function hookZone(zone: Instance)
 		local standsFolder = zone:WaitForChild("Stands", 30)
 		if not standsFolder then
 			return
 		end
 		standsFolder.ChildAdded:Connect(function(child)
-			if os.clock() - attachedAt > 3 and child:IsA("Model") and Economy.STAND_BY_ID[child.Name] then
-				local pivot = child:GetPivot()
-				local plot = Stations.PLOT_BY_STAND[child.Name]
-				sparkle(pivot.Position, if plot then plot.color else Color3.new(1, 1, 1))
+			if child:IsA("Model") and Economy.STAND_BY_ID[child.Name] then
+				task.defer(celebrate, child)
 			end
 		end)
 	end
@@ -561,18 +453,8 @@ local function attachOwnZone(zones: Instance)
 		connection:Disconnect()
 	end
 	table.clear(zoneConnections)
-	for model in labels do
-		if model.Parent and Stations.BY_ID[model.Name] and Stations.BY_ID[model.Name].scope == "Zone" then
-			labels[model] = nil
-		end
-	end
-	for standId, visual in stands do
-		if visual.barGui then
-			visual.barGui:Destroy()
-		end
-		stands[standId] = nil
-	end
-
+	table.clear(ownPads)
+	table.clear(ownStands)
 	local zoneIndex = player:GetAttribute("ZoneIndex")
 	if typeof(zoneIndex) ~= "number" then
 		return
@@ -584,30 +466,33 @@ local function attachOwnZone(zones: Instance)
 		warn("[WorldController] Own zone not found")
 		return
 	end
+	local function addPad(child: Instance)
+		if child:IsA("Model") and Stations.BY_ID[child.Name] then
+			ownPads[child.Name] = child
+		end
+	end
+	local function addStand(child: Instance)
+		if child:IsA("Model") and Economy.STAND_BY_ID[child.Name] then
+			ownStands[child.Name] = child
+		end
+	end
 	for _, child in stationsFolder:GetChildren() do
-		attachPad(child)
+		addPad(child)
 	end
 	for _, child in standsFolder:GetChildren() do
-		attachStand(child)
+		addStand(child)
 	end
-	table.insert(zoneConnections, stationsFolder.ChildAdded:Connect(attachPad))
-	table.insert(zoneConnections, standsFolder.ChildAdded:Connect(attachStand))
+	table.insert(zoneConnections, stationsFolder.ChildAdded:Connect(addPad))
+	table.insert(zoneConnections, standsFolder.ChildAdded:Connect(addStand))
 end
 
 local function attachArena(arena: Instance)
-	local hub = arena:WaitForChild("Hub", 30)
-	local hubStations = hub and hub:WaitForChild("Stations", 30)
-	if hubStations then
-		for _, child in hubStations:GetChildren() do
-			attachPad(child)
-		end
-	end
 	local zones = arena:WaitForChild("Zones", 30)
 	if not zones then
 		warn("[WorldController] Zones not found")
 		return
 	end
-	watchStructures(zones)
+	watchZones(zones)
 	attachOwnZone(zones)
 	player:GetAttributeChangedSignal("ZoneIndex"):Connect(function()
 		attachOwnZone(zones)
@@ -616,6 +501,16 @@ local function attachArena(arena: Instance)
 	local snap = StateController.snapshot()
 	if snap then
 		onSnapshot(snap)
+	end
+end
+
+local function bindTag(tag: string, added: (Instance) -> (), removed: ((Instance) -> ())?)
+	for _, instance in CollectionService:GetTagged(tag) do
+		added(instance)
+	end
+	CollectionService:GetInstanceAddedSignal(tag):Connect(added)
+	if removed then
+		CollectionService:GetInstanceRemovedSignal(tag):Connect(removed)
 	end
 end
 
@@ -633,26 +528,18 @@ function WorldController.init()
 		end
 	end)
 
-	for _, instance in CollectionService:GetTagged(MANAGER_TAG) do
-		trackNpc(instance)
-	end
-	CollectionService:GetInstanceAddedSignal(MANAGER_TAG):Connect(trackNpc)
-	CollectionService:GetInstanceRemovedSignal(MANAGER_TAG):Connect(function(instance)
-		if instance:IsA("Model") then
-			npcs[instance] = nil
-		end
-	end)
+	bindTag(ANIM_TAG, trackAnimated, untrack)
+	bindTag(MANAGER_TAG, trackManager, untrack)
+	bindTag(GLOW_TAG, startGlow)
 
 	StateController.snapshotChanged:Connect(onSnapshot)
-	StateController.cycleStarted:Connect(onCycle)
-	RunService.Heartbeat:Connect(function()
-		animateNpcs()
-		updateProgress()
-	end)
+	StandTracker.payout:Connect(onPayout)
+	StationController.stepped:Connect(pressPad)
+	RunService.Heartbeat:Connect(animateAll)
 	task.spawn(function()
 		while true do
-			task.wait(0.25)
-			refreshLabels()
+			task.wait(0.5)
+			refreshPads()
 		end
 	end)
 end

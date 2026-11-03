@@ -122,7 +122,8 @@ end
 
 local function refreshRates(s: Session)
 	s.buff = EconomyMath.activeBuffMultiplier(s.data, os.time())
-	s.rate = EconomyMath.managedRate(s.data, mods(), s.entitlements, s.buff)
+	-- Managers plus the Auto-Collect gamepass (x2 Income is applied inside EconomyMath.globalMultiplier).
+	s.rate = EconomyMath.passiveRate(s.data, mods(), s.entitlements, s.buff)
 end
 
 local function earn(s: Session, amount: BigNumber)
@@ -223,6 +224,7 @@ local function standView(s: Session, def: StandDef, serverNow: number, clockNow:
 	return {
 		owned = state.level > 0,
 		managed = state.level > 0 and state.managerHired,
+		autoCollected = EconomyMath.isAutoCollected(d, def.id, ent),
 		multiplier = state.multiplier,
 		speed = state.speed,
 		interval = EconomyMath.standInterval(d, def),
@@ -283,6 +285,8 @@ local function buildSnapshot(s: Session): Types.Snapshot
 		statues = table.clone(d.statues),
 		stairwayUnlocked = EconomyMath.isStairwayUnlocked(d),
 		seasonId = SeasonService.current().id,
+		entitlements = table.clone(s.entitlements),
+		starterPackClaimed = d.starterPackClaimed,
 	}
 end
 
@@ -364,8 +368,8 @@ end
 
 local function onStandMain(s: Session, def: StandDef)
 	local state = standOf(s.data, def.id)
-	if state.level == 0 or state.managerHired then
-		return -- not owned yet, or the manager runs it
+	if state.level == 0 or state.managerHired or s.entitlements.autoCollect then
+		return -- not owned yet, or a manager / Auto-Collect already runs it
 	end
 	startCycle(s, def)
 	if s.dirty then
@@ -564,6 +568,16 @@ local function tickSession(s: Session, now: number)
 	for _, def in Economy.STANDS do
 		completeCycle(s, def, now)
 	end
+	-- Auto-Collected stands never run a hand cycle, so reveal their Multiplier pad directly.
+	if s.entitlements.autoCollect then
+		for _, def in Economy.STANDS do
+			local state = d.stands[def.id]
+			if state and EconomyMath.isAutoCollected(d, def.id, s.entitlements) and state.revealed < Economy.REVEAL.Multiplier then
+				state.revealed = Economy.REVEAL.Multiplier
+				s.dirty = true
+			end
+		end
+	end
 	if s.dirty then
 		changed(s)
 	end
@@ -688,24 +702,32 @@ function EconomyService.grantCurrency(player: Player, amount: BigNumber): boolea
 	return true
 end
 
--- Time Warp product: TIME_WARP_SECONDS of managed income, or of the best owned stand if none is managed.
+-- Time Warp product: MonetizationConfig.TIME_WARP_HOURS of income at the current passive rate.
 function EconomyService.grantTimeWarp(player: Player): boolean
 	local s = sessions[player]
 	if not s then
 		return false
 	end
-	local rate = EconomyMath.managedRate(s.data, mods(), s.entitlements, 1)
-	if rate.m <= 0 then
-		for _, def in Economy.STANDS do
-			if EconomyMath.isOwned(s.data, def.id) then
-				rate = BigNumber.max(rate, EconomyMath.standRate(s.data, def, mods(), s.entitlements, 1))
-			end
-		end
-	end
-	local amount = BigNumber.mulNumber(rate, Economy.TIME_WARP_SECONDS)
+	local amount = EconomyMath.timeWarpEarnings(s.data, mods(), s.entitlements, EconomyMath.timeWarpSeconds())
 	earn(s, amount)
+	checkMilestones(s)
 	changed(s)
 	notify(s, "Success", "Time Warp! Thanks for your support!", amount)
+	return true
+end
+
+-- Starter Pack product: one-time currency boost. Returns false if already claimed (caller decides).
+function EconomyService.grantStarterPack(player: Player): boolean
+	local s = sessions[player]
+	if not s or s.data.starterPackClaimed then
+		return false
+	end
+	local amount = EconomyMath.starterPackAmount(s.data, mods(), s.entitlements)
+	s.data.starterPackClaimed = true
+	earn(s, amount)
+	checkMilestones(s)
+	changed(s)
+	notify(s, "Success", "Starter Pack opened! Thanks for your support!", amount)
 	return true
 end
 

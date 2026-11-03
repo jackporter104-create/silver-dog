@@ -28,7 +28,7 @@ src/
       Evolution.luau         8 levels (x42^(L-1)), requirements, the 5 perks (chosen on physical perk pads)
       Statues.luau           10 permanent statues (stand-specific, Offline and All multipliers)
       Stations.luau          World grid (Hub + 8 zones), zone-local pads/plots, world transforms, decor beds
-      Monetization.luau      Gamepass / developer product ids (0 = disabled)
+      MonetizationConfig.luau Paste your gamepass / developer product ids here (0 = hidden + ignored)
       Experiments.luau       A/B experiments + UI defaults
       Seasons/               init.luau registry + Default.luau + CoralCarnival.luau (example event)
   server/                    ServerScriptService.Server
@@ -42,17 +42,19 @@ src/
       ArenaService.luau      Builds Hub + zones, assigns zones on join, diff-syncs each zone, own-zone proximity
       SeasonService.luau     Active season from server time, live switching
       ExperimentService.luau Deterministic A/B buckets + live UI overrides
-      MonetizationService.luau Gamepass entitlements, idempotent ProcessReceipt
+      MonetizationService.luau Gamepass entitlements (x2 Income, Auto-Collect), idempotent ProcessReceipt
       DevService.luau        /give chat command for testing (Studio, owner, allowlist)
   client/                    StarterPlayer.StarterPlayerScripts.Client
     Main.client.luau         Bootstrap
     Controllers/
       StateController.luau   Receives Tick/Snapshot/Cycle, extrapolates currency every frame
       StationController.luau Step-on detection, [E] interaction, hold-to-run stands, hold-to-evolve
-      WorldController.luau   Own-zone price rows, cycle bars, manager NPC animation (all zones), sparkles, statues
+      StandTracker.luau      Client timing of own stands: cycle progress + payout events (feedback only)
+      WorldController.luau   Animator (lids, gears, corals, kelp, tentacles, icons), manager idles, glow tweens, juice
     UI/
       Theme.luau             Oceanic palette, fonts, UI helpers
-      HudController.luau     Info-only HUD: currency, income, evolution, stands/buff status, context prompt, toasts
+      HudController.luau     All names/prices/prompts (no 3D text), zone banner, cycle bar, payout pops, toasts
+      ShopPanel.luau         Shell Shop panel (opened by the Shop pad): gamepasses + products via Roblox prompts
     Ocean/
       OceanSpawner.luau      Progression-driven environment: fish, corals, kelp, bubbles, light rays, LOD
       FishFactory.luau       Primitive-part fish, tropical fish, jellyfish, mantas, whales
@@ -73,8 +75,9 @@ tools/
 3. **Or build a place file.** `rojo build default.project.json -o OceanIdle.rbxl`, then open it in Studio.
 4. **DataStores.** Publish the place, then turn on *Game Settings → Security → Enable Studio Access to API Services*.
    Without it, `DataService` warns and keeps data in memory (nothing persists), which is fine for quick iteration.
-5. **Monetization.** Create the "Double Income" gamepass and the "Time Warp" developer product. Put their ids in
-   `src/shared/Config/Monetization.luau`. Prompt purchases from the Roblox menu or your own shop (the HUD has no buy buttons).
+5. **Monetization.** Create two gamepasses (x2 Income, Auto-Collect) and two developer products (Time Warp,
+   Starter Pack) in the Creator Dashboard. Paste their ids into `src/shared/Config/MonetizationConfig.luau`.
+   Until an id is set, its shop card shows "Coming soon" and the server ignores it.
 6. **Server size.** Set *Game Settings → Places → Max Players* to **8** (one reef each). A 9th player is kicked
    with a friendly "this ocean is full" message.
 7. **Press Play.** You spawn on your own reef facing the Pearl Clam. Stand on its pad to run it.
@@ -103,9 +106,9 @@ python3 tools/run_luau.py tools/sim.luau
   attribute and the owner sign, and spawns the character there on every respawn. Leaving frees and clears the reef.
 * **Layout:** every reef has the same layout, rotated to face the Hub. Stand plots spiral outward clockwise from
   the spawn, each further away than the last.
-* **Visibility vs. ownership:** reef geometry is built on the server, so every player sees every reef. Prices are
-  shown only on your own pads. The client only prompts for your own and Hub pads, and the server resolves zone pads
-  in the **requesting player's own reef**. Standing on someone else's pad can never buy anything.
+* **Visibility vs. ownership:** reef geometry is built on the server, so every player sees every reef. Names and
+  prices are shown only in your own HUD. The client only prompts for your own and Hub pads, and the server resolves
+  zone pads in the **requesting player's own reef**. Standing on someone else's pad can never buy anything.
 
 ## How to play (the physical loop)
 
@@ -140,7 +143,7 @@ StateController ◀── Tick {c, r, serverTime, buff} 1 Hz (UnreliableRemoteEv
                 ◀── Snapshot (on change: stands, buffs, pad prices and locks)
                 ◀── Cycle (hand-run cycle started) / Notify (toasts) / UiConfig (A/B)
 HUD:   display = currency + rate × (GetServerTimeNow() − serverTime), every frame
-World: own-reef price rows and cycle bars; manager NPC work loop for every reef
+World: animated businesses, managers and pad icons for every reef (no 3D text); coin bursts on own payouts
 ```
 
 * **Zero client economy math.** The client only formats and compares values the server sent.
@@ -190,6 +193,48 @@ Evolution 2 (x42)     54.7 min      Heart of the Ocean     ~90 h
 Evolution requirements and statue costs were calibrated with the simulator. Tune `src/shared/Config/*`, then rerun it.
 Income grows only polynomially within a run, so moving a threshold by one power of ten shifts its milestone noticeably.
 
+## Visual style
+
+* **No 3D text.** The world has no BillboardGuis. Pads carry floating 3D icons: mystery box (Deed), golden coin
+  (run the stand), up-arrow (Multiplier), lightning bolt (Speed), top hat (Manager), crystal (Buff / Evolve) and a
+  treasure chest (Shop). Every name, price and prompt appears in the 2D HUD when you stand near a pad.
+* **Procedural businesses** (Parts, WedgeParts, sphere-meshed ellipsoids, lights, particles; no external assets):
+
+  | Business | Model | Motion |
+  |---|---|---|
+  | Pearl Clam | Ribbed shell with a nacre bowl and a glowing pearl | Lid slowly opens and closes, the pearl hops and sparkles |
+  | Coral Farm | Seven tall corals with glowing neon tips on a reef rock | Corals sway, tips pulse, bubbles rise |
+  | Kelp Factory | Glass vats with kelp, pipes, chimney, two meshing gears | Gears spin, kelp sways, bubbles from the chimney |
+  | Sunken Vault | Half-buried chest overflowing with gold, coins spilling out | Lid creaks, gold glitters, gems pulse |
+  | Kraken Den | Dark rock cave with glowing eyes | Five glowing-sucker tentacles wave, purple mist |
+
+* **Animation:** moving pieces are Models tagged `OceanAnim` (Hinge, Spin, Sway, Bounce, Float). One
+  `BulkMoveTo` per frame on the client moves them, with distance LOD (nothing animates beyond 180 studs).
+  Lights and neon pulse with TweenService loops (`OceanGlow`). Managers do a bouncy idle with waving arms and a
+  spinning hop every few seconds.
+* **Juice:** pads squish and sparkle when stepped on, coins fountain from your stands on every payout, "+value"
+  pops rise from the currency pill, and new businesses (anyone's) appear with sparkles, bubbles and a highlight flash.
+* MeshParts with custom meshes need uploaded asset ids, so this build uses primitive parts and SpecialMesh spheres
+  only. Swap in MeshParts later by editing the builders in `ArenaService`.
+
+## Monetization
+
+All ids live in `src/shared/Config/MonetizationConfig.luau`. Every grant happens on the server.
+
+| Item | Type | Effect | Where it's applied |
+|---|---|---|---|
+| x2 Income | Gamepass | x2 on all income from every stand (managed, hand-run, Auto-Collect, offline) | `EconomyMath.globalMultiplier` via `entitlements.doubleIncome` |
+| Auto-Collect | Gamepass | Owned stands without a manager run by themselves while you're online, at hand-run speed | `EconomyMath.autoCollectRate`, added to the passive rate in `EconomyService` |
+| Time Warp | Developer product | Instantly grants 4 h of income at the current passive rate (offline bonuses apply, no offline cap). Players without automation get their best stand's hand-run rate | `EconomyMath.timeWarpEarnings` |
+| Starter Pack | Developer product (one-time) | 250K × the current Evolution multiplier (at least 30 min of income). A repeat purchase becomes a Time Warp, so nobody is charged for nothing | `EconomyMath.starterPackAmount`, `data.starterPackClaimed` |
+
+* **Gamepasses:** checked with `UserOwnsGamePassAsync` on join and granted live through `PromptGamePassPurchaseFinished`.
+  They're exposed to the shop as the read-only player attributes `OwnsDoubleIncome` / `OwnsAutoCollect`.
+* **ProcessReceipt** is idempotent. The PurchaseId is stored in the profile with the grant, and `PurchaseGranted` is
+  returned only after that save succeeds; otherwise `NotProcessedYet` and Roblox retries without a double grant.
+* **Shell Shop:** the shop opens only from the Shop pad in your plaza (the HUD has no buy buttons). Cards show the
+  live Robux price, or "Owned ✓" / "Claimed ✓" / "Coming soon".
+
 ## Anti-cheat and data safety
 
 * Intent-only remotes: the only argument is a whitelisted station id. Extra arguments count as malformed.
@@ -220,7 +265,7 @@ as the player attribute `Experiments` and logged through `AnalyticsService`. For
 * No two visible faces are coplanar. Each stacked layer has its own height above its surface (stones +0.3, plot base +0.3,
   pad lip +0.25, pad +0.45, inlay +0.55; sea floor 0.01, reef/Hub ground 0.3, reef plaza 0.6). No glowing sheets at
   camera height.
-* Ocean visuals are client-only. Manager NPCs are server-built but animated locally (only within 160 studs).
+* Ocean visuals are client-only. Business models and managers are server-built but animated locally (only within 180 studs).
   All schools and NPCs move with `Workspace:BulkMoveTo`. Distance bands act as LOD.
 * Creature budget comes from the graphics quality level, capped on touch devices. Few, low-rate particle emitters.
   No Bloom or global shadows on mobile.

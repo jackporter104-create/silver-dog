@@ -42,6 +42,7 @@ local function newData(): Types.PlayerData
 		statues = {},
 		lastOnline = 0,
 		totalRuns = 0,
+		starterPackClaimed = false,
 		receipts = {},
 	}
 end

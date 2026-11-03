@@ -72,7 +72,8 @@ local function onAction(player: Player, stationId: unknown, ...: unknown)
 	end
 
 	local station = Stations.BY_ID[stationId]
-	if not station then
+	if not station or station.kind == "Shop" then
+		-- The Shop pad only opens client UI; purchases go through Roblox prompts and ProcessReceipt.
 		malformed(player)
 		return
 	end

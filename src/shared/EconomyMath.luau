@@ -15,6 +15,7 @@ local Types = require(script.Parent.Types)
 local Economy = require(script.Parent.Config.Economy)
 local Evolution = require(script.Parent.Config.Evolution)
 local Statues = require(script.Parent.Config.Statues)
+local MonetizationConfig = require(script.Parent.Config.MonetizationConfig)
 
 type BigNumber = BigNumber.BigNumber
 type PlayerData = Types.PlayerData
@@ -37,7 +38,7 @@ EconomyMath.NEUTRAL_MODIFIERS = table.freeze({
 	standMultipliers = table.freeze({}),
 }) :: EconomyModifiers
 
-EconomyMath.NO_ENTITLEMENTS = table.freeze({ doubleIncome = false }) :: Entitlements
+EconomyMath.NO_ENTITLEMENTS = table.freeze({ doubleIncome = false, autoCollect = false }) :: Entitlements
 
 local DEFAULT_STAND: StandState = table.freeze({ level = 0, multiplier = 0, speed = 0, managerHired = false, revealed = 0 })
 
@@ -95,7 +96,7 @@ function EconomyMath.isPadVisible(data: PlayerData, kind: string, target: string
 		local buff = data.buffs[target]
 		return buff ~= nil and buff.unlocked
 	end
-	return true
+	return true -- Hub pads and the Shop
 end
 
 -- ===== Costs =====
@@ -206,6 +207,32 @@ function EconomyMath.managedRate(data: PlayerData, mods: EconomyModifiers, ent: 
 	return total
 end
 
+-- Whether the Auto-Collect gamepass runs this stand (owned, no manager).
+function EconomyMath.isAutoCollected(data: PlayerData, standId: string, ent: Entitlements): boolean
+	return ent.autoCollect and EconomyMath.isOwned(data, standId) and not EconomyMath.isManaged(data, standId)
+end
+
+-- Auto-Collect: every owned, unmanaged stand produces continuously at hand-run speed
+-- (manual value per manual interval), exactly as if the player stood on its pad.
+function EconomyMath.autoCollectRate(data: PlayerData, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
+	if not ent.autoCollect then
+		return ZERO
+	end
+	local total = ZERO
+	for _, def in Economy.STANDS do
+		if EconomyMath.isAutoCollected(data, def.id, ent) then
+			local value = EconomyMath.manualCycleValue(data, def, mods, ent, buff)
+			total = BigNumber.add(total, BigNumber.mulNumber(value, 1 / EconomyMath.manualInterval(data, def)))
+		end
+	end
+	return total
+end
+
+-- Everything that earns without the player standing on a pad: managers plus Auto-Collect.
+function EconomyMath.passiveRate(data: PlayerData, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
+	return BigNumber.add(EconomyMath.managedRate(data, mods, ent, buff), EconomyMath.autoCollectRate(data, mods, ent, buff))
+end
+
 -- ===== Global buffs =====
 
 function EconomyMath.isBuffMilestoneReached(data: PlayerData, def: BuffDef): boolean
@@ -246,6 +273,37 @@ function EconomyMath.offlineEarnings(data: PlayerData, mods: EconomyModifiers, e
 	local perk = PERK.deepCurrentsMultiplier ^ EconomyMath.perkStacks(data, "DeepCurrents")
 	local earned = BigNumber.mulNumber(EconomyMath.managedRate(data, mods, ent, 1), clamped * Economy.OFFLINE.efficiency * perk)
 	return BigNumber.mul(earned, EconomyMath.statueMultiplier(data, "Offline"))
+end
+
+-- ===== Developer products =====
+
+-- Time Warp: `seconds` of income at the current passive rate (no buff), with the same offline
+-- bonuses (Deep Currents, Tide Keeper) but no offline cap. Players without any automation get the
+-- hand-run rate of their best stand, so the purchase is never worth zero.
+function EconomyMath.timeWarpEarnings(data: PlayerData, mods: EconomyModifiers, ent: Entitlements, seconds: number): BigNumber
+	local rate = EconomyMath.passiveRate(data, mods, ent, 1)
+	if rate.m <= 0 then
+		for _, def in Economy.STANDS do
+			if EconomyMath.isOwned(data, def.id) then
+				local manual = BigNumber.mulNumber(EconomyMath.manualCycleValue(data, def, mods, ent, 1), 1 / EconomyMath.manualInterval(data, def))
+				rate = BigNumber.max(rate, manual)
+			end
+		end
+	end
+	local perk = PERK.deepCurrentsMultiplier ^ EconomyMath.perkStacks(data, "DeepCurrents")
+	local earned = BigNumber.mulNumber(rate, math.max(seconds, 0) * perk)
+	return BigNumber.mul(earned, EconomyMath.statueMultiplier(data, "Offline"))
+end
+
+function EconomyMath.timeWarpSeconds(): number
+	return MonetizationConfig.TIME_WARP_HOURS * 3600
+end
+
+-- Starter Pack: base x Evolution multiplier, and at least STARTER_PACK_MIN_MINUTES of current income.
+function EconomyMath.starterPackAmount(data: PlayerData, mods: EconomyModifiers, ent: Entitlements): BigNumber
+	local scaled = BigNumber.mulNumber(EconomyMath.evolutionMultiplier(data.evolution.level), MonetizationConfig.STARTER_PACK_BASE)
+	local income = EconomyMath.timeWarpEarnings(data, mods, ent, MonetizationConfig.STARTER_PACK_MIN_MINUTES * 60)
+	return BigNumber.max(scaled, income)
 end
 
 -- ===== Evolution & Statues =====
