@@ -4,7 +4,7 @@
 
 	Rendering rules (these prevent z-fighting and flicker):
 	  * No two visible faces are ever coplanar. Stacked parts use distinct heights
-	    (sea floor 0, plaza 0.4, stepping stones 0.3, neon lip 0.6, pad 1.0, inlay 1.2).
+	    (sea floor 0.01, plaza 0.4, stepping stones 0.3, neon lip 0.6, pad 1.0, inlay 1.2).
 	  * Parts that touch share an edge, not a volume (stair steps do not overlap).
 	  * No large transparent or neon sheets at camera height.
 
@@ -25,6 +25,21 @@ type StationDef = Stations.StationDef
 local ArenaService = {}
 
 local ARENA_NAME = "OceanArena"
+local SEA_FLOOR_TOP = 0.01
+
+-- The Studio Baseplate template adds a Baseplate (top at y = 0) and a SpawnLocation
+-- (top at y = 1). Both are coplanar with arena floors and flicker, so the arena replaces them.
+local function removeTemplateParts()
+	local baseplate = Workspace:FindFirstChild("Baseplate")
+	if baseplate and baseplate:IsA("BasePart") then
+		baseplate:Destroy()
+	end
+	for _, child in Workspace:GetChildren() do
+		if child:IsA("SpawnLocation") then
+			child:Destroy()
+		end
+	end
+end
 
 local PAD_BASE = Color3.fromRGB(28, 54, 84)
 local MARBLE = Color3.fromRGB(236, 232, 222)
@@ -347,10 +362,12 @@ function ArenaService.init()
 	if existing then
 		existing:Destroy()
 	end
+	removeTemplateParts()
 	local arena = Instance.new("Folder")
 	arena.Name = ARENA_NAME
 
-	disc("SeaFloor", Vector3.zero, Stations.FLOOR_RADIUS * 2, 4, 0, Color3.fromRGB(214, 196, 150), Enum.Material.Sand, arena)
+	-- Lifted 0.01 above y = 0 so it never shares a plane with a baseplate (Studio template baseplates top out at 0).
+	disc("SeaFloor", Vector3.zero, Stations.FLOOR_RADIUS * 2, 4, SEA_FLOOR_TOP, Color3.fromRGB(214, 196, 150), Enum.Material.Sand, arena)
 
 	-- Invisible boundary ring (24 segments), open to the north where the stairway leaves.
 	local segments = 24

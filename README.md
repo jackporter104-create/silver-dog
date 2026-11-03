@@ -63,7 +63,7 @@ tools/
    This installs Rojo 7.7.1. Then install the Rojo Studio plugin with `rojo plugin install`.
 2. **Live sync.** Run `rojo serve` (default port 34872). In Roblox Studio, open a new **Baseplate** place,
    open the Rojo plugin, and click **Connect**. The `Shared`, `Server` and `Client` folders appear in their
-   services. Delete the default `Baseplate` part so it doesn't overlap the sea floor (the arena builds itself at runtime).
+   services. The arena builds itself at runtime and removes the template `Baseplate` and `SpawnLocation` (they z-fight with the arena floor).
 3. **Or build a place file.** `rojo build default.project.json -o OceanIdle.rbxl`, then open it in Studio.
 4. **DataStores.** Publish the place, then turn on *Game Settings → Security → Enable Studio Access to API Services*.
    Without it, `DataService` warns and keeps data in memory (nothing persists), which is fine for quick iteration.
