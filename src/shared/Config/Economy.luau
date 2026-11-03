@@ -1,105 +1,163 @@
 --!strict
 --[[
-	Core economy tuning. Pure data. Shared by server (authority) and tools/sim.luau.
+	Core economy tuning ("Business Empire" model). Pure data, so tools/sim.luau can load it.
 
-	Pacing targets (validated with `luau tools/sim.luau` via tools/run_luau.py):
-	  * First 1K in about 2-3 minutes, first 1M in about 20 minutes. Numbers start at 0.
-	  * 1B (first Evolution) is the first big achievement, about 1.5-2 hours of play.
-	  * Generators are gated behind Investor counts. Those are the upgrade walls.
+	Each stand is an income source that produces `baseValue` per cycle of `baseInterval` seconds.
+	  * Multiplier pad: level m multiplies value per cycle by 2^m (x2, x4, x8 ...).
+	  * Speed pad: level s divides the interval by 2^s (x2, x4, x8 ...), capped at MAX_SPEED_LEVEL.
+	  * Manager pad: once hired, the stand cycles forever on its own (and earns offline).
+	    Without a manager the player stands on the stand's main pad to run cycles by hand.
+	  * Deed: the main pad of a stand the player does not own yet. Paying the deed unlocks it.
+	Pacing targets (validated with tools/sim.luau): first 1K in a few minutes, 1M around 20 min,
+	1B (first Evolution) as the first big achievement after about 1-2 hours.
 ]]
 
-export type GeneratorDef = {
+export type StandDef = {
 	id: string,
 	name: string,
 	description: string,
-	baseCost: number,
-	growth: number,
-	baseOutput: number, -- currency/s per level before multipliers
-	requiredInvestors: number,
+	managerName: string,
+	npc: "Crab" | "Mermaid",
+	deedCost: number, -- 0 = owned from the start
+	baseValue: number, -- currency per cycle at multiplier level 0
+	baseInterval: number, -- seconds per cycle at speed level 0
+	multiplierCost: number,
+	multiplierGrowth: number,
+	speedCost: number,
+	speedGrowth: number,
+	managerCost: number,
 }
 
-export type AutoClickerTier = {
-	cost: number,
-	costExponent: number?, -- when set, cost = 10^costExponent (late-game tiers)
-	clicksPerSecond: number,
-	capacity: number, -- automated clicks per full battery
-	infinite: boolean,
-	requiredEvolution: number,
+export type BuffDef = {
+	id: string,
+	name: string,
+	multiplier: number, -- applied to ALL stands while active
+	duration: number, -- seconds
+	cooldown: number, -- seconds after activation before it can be used again
+	requiredStands: number, -- unlocks permanently (until Evolution) at this many owned stands
 }
 
 local Economy = {}
 
-Economy.DATA_VERSION = 1
-Economy.BASE_CLICK = 1
+Economy.DATA_VERSION = 2
 
-Economy.CLICK_UPGRADE = {
-	name = "Fin Forge",
-	baseCost = 10,
-	growth = 1.17,
-	milestones = { { every = 25, multiplier = 3 }, { every = 100, multiplier = 10 } } :: { Milestone },
-}
+Economy.STANDS = {
+	{
+		id = "PearlClam",
+		name = "Pearl Clam",
+		description = "A giant clam that grows shiny pearls.",
+		managerName = "Captain Crab",
+		npc = "Crab",
+		deedCost = 0,
+		baseValue = 1,
+		baseInterval = 1,
+		multiplierCost = 25,
+		multiplierGrowth = 4.5,
+		speedCost = 100,
+		speedGrowth = 6,
+		managerCost = 300,
+	},
+	{
+		id = "CoralFarm",
+		name = "Coral Farm",
+		description = "Bright coral that sprouts pearls.",
+		managerName = "Coral the Mermaid",
+		npc = "Mermaid",
+		deedCost = 2_500,
+		baseValue = 30,
+		baseInterval = 3,
+		multiplierCost = 5_000,
+		multiplierGrowth = 4.5,
+		speedCost = 20_000,
+		speedGrowth = 6,
+		managerCost = 30_000,
+	},
+	{
+		id = "KelpFactory",
+		name = "Kelp Factory",
+		description = "Busy machines press kelp into pearls.",
+		managerName = "Foreman Crab",
+		npc = "Crab",
+		deedCost = 150_000,
+		baseValue = 1_500,
+		baseInterval = 6,
+		multiplierCost = 300_000,
+		multiplierGrowth = 4.5,
+		speedCost = 1_200_000,
+		speedGrowth = 6,
+		managerCost = 1_500_000,
+	},
+	{
+		id = "SunkenVault",
+		name = "Sunken Vault",
+		description = "An ancient vault overflowing with treasure.",
+		managerName = "Marina the Mermaid",
+		npc = "Mermaid",
+		deedCost = 2_000_000,
+		baseValue = 60_000,
+		baseInterval = 12,
+		multiplierCost = 6_000_000,
+		multiplierGrowth = 4.5,
+		speedCost = 25_000_000,
+		speedGrowth = 6,
+		managerCost = 15_000_000,
+	},
+	{
+		id = "KrakenDen",
+		name = "Kraken Den",
+		description = "A friendly kraken juggles giant pearls.",
+		managerName = "King Crab",
+		npc = "Crab",
+		deedCost = 60_000_000,
+		baseValue = 1_500_000,
+		baseInterval = 24,
+		multiplierCost = 150_000_000,
+		multiplierGrowth = 4.5,
+		speedCost = 600_000_000,
+		speedGrowth = 6,
+		managerCost = 400_000_000,
+	},
+} :: { StandDef }
 
--- Owning N levels of a generator multiplies its output at every milestone. Milestones compound,
--- so late-game income outruns the 1.15x cost growth slowly and numbers get absurd.
-export type Milestone = { every: number, multiplier: number }
-Economy.GENERATOR_MILESTONES = {
-	{ every = 25, multiplier = 3 },
-	{ every = 100, multiplier = 10 },
-} :: { Milestone }
+Economy.STAND_BY_ID = {} :: { [string]: StandDef }
+for _, def in Economy.STANDS do
+	Economy.STAND_BY_ID[def.id] = def
+end
+Economy.STARTING_STAND = "PearlClam"
 
-Economy.INVESTOR = {
-	baseCost = 1000,
-	growth = 1.14,
-	bonusPerInvestor = 0.01, -- flat +1% passive income each
-}
+Economy.MAX_SPEED_LEVEL = 8 -- x256 speed
+Economy.MAX_MULTIPLIER_LEVEL = 1000
 
-Economy.GENERATORS = {
-	{ id = "Shrimp", name = "Shrimp Buddy", description = "A tiny helper that finds pearls.", baseCost = 15, growth = 1.15, baseOutput = 0.5, requiredInvestors = 0 },
-	{ id = "Kelp", name = "Kelp Farm", description = "Swaying kelp traps drifting pearls.", baseCost = 150, growth = 1.15, baseOutput = 4, requiredInvestors = 0 },
-	{ id = "ClamBed", name = "Pearl Clam Bed", description = "Clams that grow pearls all day.", baseCost = 1_600, growth = 1.15, baseOutput = 30, requiredInvestors = 0 },
-	{ id = "Reef", name = "Coral Reef", description = "A bustling reef full of workers.", baseCost = 20_000, growth = 1.15, baseOutput = 220, requiredInvestors = 1 },
-	{ id = "Ship", name = "Sunken Ship", description = "Salvage crews dig up treasure.", baseCost = 300_000, growth = 1.15, baseOutput = 1_700, requiredInvestors = 3 },
-	{ id = "Vault", name = "Treasure Vault", description = "Ancient vaults overflowing with pearls.", baseCost = 5e6, growth = 1.15, baseOutput = 13_000, requiredInvestors = 8 },
-	{ id = "Kraken", name = "Kraken Den", description = "A friendly kraken juggles pearls.", baseCost = 8e7, growth = 1.15, baseOutput = 100_000, requiredInvestors = 15 },
-	{ id = "Atlantis", name = "Atlantis Engine", description = "Lost technology prints pearls.", baseCost = 1.4e9, growth = 1.15, baseOutput = 800_000, requiredInvestors = 30 },
-	{ id = "Abyss", name = "Abyssal Reactor", description = "Deep-sea vents forge pearls.", baseCost = 2.5e10, growth = 1.15, baseOutput = 6.5e6, requiredInvestors = 55 },
-	{ id = "Leviathan", name = "Leviathan Forge", description = "Legendary beasts power the forge.", baseCost = 5e11, growth = 1.15, baseOutput = 5.5e7, requiredInvestors = 90 },
-} :: { GeneratorDef }
+-- Global buffs: fixed pads in the plaza. Only the strongest active buff applies (they never
+-- stack), which keeps the boost noticeable without breaking the economy.
+Economy.BUFFS = {
+	{ id = "TidalRush", name = "Tidal Rush", multiplier = 2, duration = 30, cooldown = 90, requiredStands = 2 },
+	{ id = "CoralBloom", name = "Coral Bloom", multiplier = 3, duration = 30, cooldown = 150, requiredStands = 3 },
+	{ id = "PearlStorm", name = "Pearl Storm", multiplier = 4, duration = 30, cooldown = 240, requiredStands = 4 },
+	{ id = "LeviathanRoar", name = "Leviathan's Roar", multiplier = 6, duration = 45, cooldown = 420, requiredStands = 5 },
+} :: { BuffDef }
 
-Economy.GENERATOR_BY_ID = {} :: { [string]: GeneratorDef }
-for _, def in Economy.GENERATORS do
-	Economy.GENERATOR_BY_ID[def.id] = def
+Economy.BUFF_BY_ID = {} :: { [string]: BuffDef }
+for _, def in Economy.BUFFS do
+	Economy.BUFF_BY_ID[def.id] = def
 end
 
--- Auto-clicker: a battery of automated clicks. You recharge it at the Battery Dock in the arena.
--- The final tier never drains. It is gated behind Evolution 3 and costs 1 Quadrillion.
-Economy.AUTO_CLICKER_TIERS = {
-	{ cost = 2_500, clicksPerSecond = 2, capacity = 600, infinite = false, requiredEvolution = 1 },
-	{ cost = 150_000, clicksPerSecond = 4, capacity = 2_400, infinite = false, requiredEvolution = 1 },
-	{ cost = 2e7, clicksPerSecond = 6, capacity = 7_200, infinite = false, requiredEvolution = 1 },
-	{ cost = 5e9, clicksPerSecond = 10, capacity = 36_000, infinite = false, requiredEvolution = 2 },
-	{ cost = 2e12, clicksPerSecond = 15, capacity = 216_000, infinite = false, requiredEvolution = 2 },
-	{ cost = 0, costExponent = 15, clicksPerSecond = 20, capacity = 0, infinite = true, requiredEvolution = 3 },
-} :: { AutoClickerTier }
-
--- Clicks/s granted by the Infinite Auto-Clicker gamepass when the player's tier is lower.
-Economy.GAMEPASS_AUTO_CPS = 4
+-- Manual runs: the shortest cycle a player can run by hand (prevents sub-tick spam payouts).
+Economy.MIN_MANUAL_INTERVAL = 0.25
 
 Economy.OFFLINE = {
 	baseCapSeconds = 8 * 3600,
 	maxCapSeconds = 48 * 3600, -- hard ceiling regardless of perks
-	efficiency = 1.0, -- 100% of online generation
+	efficiency = 1.0, -- 100% of managed generation
 	minSeconds = 60, -- ignore tiny gaps (rejoins)
 }
 
--- Hard sanity limits used by save validation and purchase loops.
+-- Time Warp developer product: instantly grants this many seconds of managed income.
+Economy.TIME_WARP_SECONDS = 3600
+
+-- Hard sanity limits used by save validation.
 Economy.LIMITS = {
-	maxLevel = 10_000,
-	maxInvestors = 100_000,
-	maxCharge = 10_000_000,
 	maxReceipts = 50,
 }
-
-Economy.BUY_QUANTITIES = { 1, 10 }
 
 return Economy

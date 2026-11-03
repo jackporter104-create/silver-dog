@@ -20,8 +20,8 @@ local EconomyService = require(script.Parent.EconomyService)
 
 local MonetizationService = {}
 
-local PASS_ID = Monetization.INFINITE_AUTO_CLICKER_PASS_ID
-local OVERCHARGE_ID = Monetization.BATTERY_OVERCHARGE_PRODUCT_ID
+local PASS_ID = Monetization.DOUBLE_INCOME_PASS_ID
+local TIME_WARP_ID = Monetization.TIME_WARP_PRODUCT_ID
 
 function MonetizationService.resolveEntitlements(player: Player): Types.Entitlements
 	local owns = false
@@ -34,7 +34,7 @@ function MonetizationService.resolveEntitlements(player: Player): Types.Entitlem
 			warn("[MonetizationService] Gamepass check failed: " .. tostring(result))
 		end
 	end
-	return { infiniteAutoClicker = owns }
+	return { doubleIncome = owns }
 end
 
 local function processReceipt(receipt: { [string]: any }): Enum.ProductPurchaseDecision
@@ -52,8 +52,8 @@ local function processReceipt(receipt: { [string]: any }): Enum.ProductPurchaseD
 	end
 
 	local granted = false
-	if OVERCHARGE_ID ~= 0 and receipt.ProductId == OVERCHARGE_ID then
-		granted = EconomyService.grantBatteryOvercharge(player)
+	if TIME_WARP_ID ~= 0 and receipt.ProductId == TIME_WARP_ID then
+		granted = EconomyService.grantTimeWarp(player)
 	end
 	if not granted then
 		return Enum.ProductPurchaseDecision.NotProcessedYet
@@ -70,7 +70,7 @@ function MonetizationService.init()
 	MarketplaceService.ProcessReceipt = processReceipt
 	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, passId: number, purchased: boolean)
 		if purchased and PASS_ID ~= 0 and passId == PASS_ID then
-			EconomyService.setEntitlements(player, { infiniteAutoClicker = true })
+			EconomyService.setEntitlements(player, { doubleIncome = true })
 		end
 	end)
 end

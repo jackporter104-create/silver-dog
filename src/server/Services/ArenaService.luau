@@ -2,16 +2,20 @@
 --[[
 	ArenaService: builds the physical arena on the server from Config/Stations.
 
+	Layout: central plaza (spawn + global buff pads), five stand plots around it (stand model,
+	main pad, Multiplier / Manager / Speed pads), the Evolution Temple with perk pads to the north,
+	and the Heavenly Stairway behind it. All geometry is shared by every player. Per-player state
+	(locked, owned, managed, prices) is shown client-side by WorldController.
+
 	Rendering rules (these prevent z-fighting and flicker):
-	  * No two visible faces are ever coplanar. Stacked parts use distinct heights
-	    (sea floor 0, plaza 0.4, stepping stones 0.3, neon lip 0.6, pad 1.0, inlay 1.2).
+	  * No two visible faces are ever coplanar. Every stacked layer has its own height above the
+	    surface it sits on: stones +0.3, plot base +0.3, pad lip +0.25, pad +0.45, inlay +0.55.
+	    Surfaces: sea floor 0.01, plaza 0.4, statue platform 56.
 	  * Parts that touch share an edge, not a volume (stair steps do not overlap).
 	  * No large transparent or neon sheets at camera height.
 
-	Geometry is static and anchored. Collisions and queries are off where they are not needed.
-	Station models are named by station id. Each station has a single "Title" billboard with a
-	free row the client fills with per-player price info. Interaction does NOT use server
-	Touched events (exploitable). Clients send an intent and the server validates distance.
+	Interaction does NOT use server Touched events (exploitable). Clients send an intent when they
+	step on a pad (or press E) and the server validates distance against Config/Stations.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,17 +23,36 @@ local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Stations = require(Shared.Config.Stations)
+local Economy = require(Shared.Config.Economy)
 
 type StationDef = Stations.StationDef
+type StandPlot = Stations.StandPlot
 
 local ArenaService = {}
 
 local ARENA_NAME = "OceanArena"
 
-local PAD_BASE = Color3.fromRGB(28, 54, 84)
 local MARBLE = Color3.fromRGB(236, 232, 222)
+local PAD_BASE = Color3.fromRGB(28, 54, 84)
 local PLAZA_COLOR = Color3.fromRGB(232, 218, 182)
 local STONE_COLOR = Color3.fromRGB(196, 186, 168)
+local SURFACE_FOR_KIND = {
+	Buff = Stations.PLAZA_TOP,
+}
+
+-- The Studio Baseplate template adds a Baseplate (top at y = 0) and a SpawnLocation
+-- (top at y = 1). Both are coplanar with arena floors and flicker, so the arena replaces them.
+local function removeTemplateParts()
+	local baseplate = Workspace:FindFirstChild("Baseplate")
+	if baseplate and baseplate:IsA("BasePart") then
+		baseplate:Destroy()
+	end
+	for _, child in Workspace:GetChildren() do
+		if child:IsA("SpawnLocation") then
+			child:Destroy()
+		end
+	end
+end
 
 local function part(props: {
 	name: string,
@@ -76,13 +99,14 @@ local function disc(name: string, center: Vector3, diameter: number, thickness: 
 	})
 end
 
--- One billboard per station. With `infoRow`, the bottom 40% is left for the client's price label.
-local function titleBillboard(adornee: BasePart, text: string, offsetY: number, infoRow: boolean)
+-- Billboard named "Title". With `infoRow`, the bottom 40% is left for the client's per-player text.
+local function titleBillboard(adornee: BasePart, text: string, offsetY: number, infoRow: boolean, width: number?, maxDistance: number?)
 	local gui = Instance.new("BillboardGui")
 	gui.Name = "Title"
-	gui.Size = UDim2.fromOffset(230, if infoRow then 64 else 40)
+	local w = width or 230
+	gui.Size = UDim2.fromOffset(w, if infoRow then math.floor(w * 0.28) else math.floor(w * 0.17))
 	gui.StudsOffsetWorldSpace = Vector3.new(0, offsetY, 0)
-	gui.MaxDistance = 80
+	gui.MaxDistance = maxDistance or 80
 	gui.AlwaysOnTop = false
 	gui.LightInfluence = 0
 	local label = Instance.new("TextLabel")
@@ -98,107 +122,133 @@ local function titleBillboard(adornee: BasePart, text: string, offsetY: number, 
 	gui.Parent = adornee
 end
 
+-- Walking surface under a pad.
+local function surfaceFor(station: StationDef): number
+	if station.kind == "Statue" then
+		return station.position.Y
+	end
+	return SURFACE_FOR_KIND[station.kind] or Stations.SEA_FLOOR_TOP
+end
+
+local PAD_LABELS: { [string]: string } = {
+	Multiplier = "x2 Multiplier",
+	Speed = "x2 Speed",
+	Manager = "Hire Manager",
+}
+
+-- A flat, walk-on pad: neon lip, slate pad and coloured inlay, each at its own height.
 local function buildPad(station: StationDef, parent: Instance): Model
 	local model = Instance.new("Model")
 	model.Name = station.id
 	local pos = station.position
-	local diameter = station.radius * 1.3
-	local pad = disc("Pad", pos, diameter, 1, pos.Y + 1.0, PAD_BASE, Enum.Material.Slate, model)
-	-- Glowing lip: wider than the pad but lower, so its top never meets the pad's top face.
-	disc("Ring", pos, diameter + 1.2, 0.6, pos.Y + 0.6, station.color, Enum.Material.Neon, model, false)
-	disc("Inlay", pos, diameter * 0.55, 0.2, pos.Y + 1.2, station.color, Enum.Material.SmoothPlastic, model, false)
-
-	-- Pillar stands on the outer edge so its sign faces players arriving from the plaza.
-	local back = pos + Stations.outward(pos) * (diameter / 2 - 1.6)
-	local pillar = part({
-		name = "Pillar",
-		size = Vector3.new(2.2, 7, 2.2),
-		cframe = CFrame.new(back + Vector3.new(0, 1.0 + 3.5, 0)),
-		color = MARBLE,
-		material = Enum.Material.Marble,
-		parent = model,
-	})
-	part({
-		name = "Orb",
-		size = Vector3.new(3, 3, 3),
-		cframe = CFrame.new(back + Vector3.new(0, 1.0 + 7 + 1.6, 0)),
-		color = station.color,
-		material = Enum.Material.Neon,
-		shape = Enum.PartType.Ball,
-		collide = false,
-		parent = model,
-	})
+	local surface = surfaceFor(station)
+	local diameter = station.radius * 2
+	local pad = disc("Pad", pos, diameter, 0.5, surface + 0.45, PAD_BASE, Enum.Material.Slate, model)
+	disc("Ring", pos, diameter + 1, 0.3, surface + 0.25, station.color, Enum.Material.Neon, model, false)
+	disc("Inlay", pos, diameter * 0.6, 0.15, surface + 0.55, station.color, Enum.Material.SmoothPlastic, model, false)
 	model.PrimaryPart = pad
-	titleBillboard(pillar, station.displayName, 9, true)
+	local label = PAD_LABELS[station.kind] or station.displayName
+	local width = if station.kind == "StandMain" then 190 elseif station.kind == "Statue" then 210 else 160
+	titleBillboard(pad, label, if station.kind == "Statue" then 13 else 4.5, true, width, 60)
 	model.Parent = parent
 	return model
 end
 
-local function buildClam(station: StationDef, parent: Instance): Model
-	local model = Instance.new("Model")
-	model.Name = station.id
-	local pos = station.position
-	local base = disc("Pad", pos, 22, 1, pos.Y + 1.0, Color3.fromRGB(240, 205, 222), Enum.Material.Sand, model)
-	disc("Ring", pos, 23.2, 0.6, pos.Y + 0.6, Color3.fromRGB(255, 200, 235), Enum.Material.Neon, model, false)
-	local shellColor = Color3.fromRGB(255, 180, 210)
-	-- Shells open toward the plaza centre. The centre clam opens south, toward the spawn.
-	local facing = CFrame.lookAt(pos, pos - Stations.outward(pos))
-	part({ name = "ShellBottom", size = Vector3.new(14, 3, 11), cframe = facing * CFrame.new(0, 2.5, 0), color = shellColor, material = Enum.Material.Pebble, parent = model })
-	part({
-		name = "ShellTop",
-		size = Vector3.new(14, 2, 11),
-		cframe = facing * CFrame.new(0, 7.5, 3) * CFrame.Angles(math.rad(-35), 0, 0),
-		color = shellColor,
-		material = Enum.Material.Pebble,
-		parent = model,
-	})
-	local pearl = part({
-		name = "Pearl",
-		size = Vector3.new(5, 5, 5),
-		cframe = CFrame.new(pos + Vector3.new(0, 6.5, 0)),
-		color = Color3.fromRGB(250, 245, 255),
-		material = Enum.Material.Neon,
-		shape = Enum.PartType.Ball,
-		collide = false,
-		parent = model,
-	})
-	local light = Instance.new("PointLight")
-	light.Range = 14
-	light.Brightness = 1.2
-	light.Color = Color3.fromRGB(220, 230, 255)
-	light.Parent = pearl
-	model.PrimaryPart = base
-	titleBillboard(pearl, station.displayName, 6, false)
-	model.Parent = parent
-	return model
+-- ===== Stand models (themed props on each plot) =====
+
+local function propPart(model: Model, name: string, size: Vector3, cframe: CFrame, color: Color3, material: Enum.Material, shape: Enum.PartType?): Part
+	return part({ name = name, size = size, cframe = cframe, color = color, material = material, shape = shape, parent = model })
 end
 
-local function buildAltar(station: StationDef, parent: Instance): Model
-	local model = buildPad(station, parent)
-	local pos = station.position
-	for i = 0, 5 do
-		-- Columns at 0..300 degrees leave an opening on the axis lane in front of the altar.
-		local a = math.rad(i * 60)
-		local base = pos + Vector3.new(math.cos(a) * 13, 0, math.sin(a) * 13)
-		disc("AltarFoot", base, 3.6, 0.5, pos.Y + 0.5, MARBLE, Enum.Material.Marble, model)
-		part({
-			name = "AltarPillar",
-			size = Vector3.new(2, 15.5, 2),
-			cframe = CFrame.new(base + Vector3.new(0, 0.5 + 15.5 / 2, 0)),
-			color = Color3.fromRGB(150, 110, 220),
-			material = Enum.Material.Marble,
-			parent = model,
-		})
+local function buildClamProp(model: Model, base: CFrame, color: Color3)
+	propPart(model, "ShellBottom", Vector3.new(11, 2.5, 9), base * CFrame.new(0, 1.6, 0), color, Enum.Material.Pebble)
+	propPart(model, "ShellTop", Vector3.new(11, 1.6, 9), base * CFrame.new(0, 5.6, 3) * CFrame.Angles(math.rad(-35), 0, 0), color, Enum.Material.Pebble)
+	local pearl = propPart(model, "Pearl", Vector3.new(4, 4, 4), base * CFrame.new(0, 4.6, 0), Color3.fromRGB(250, 245, 255), Enum.Material.Neon, Enum.PartType.Ball)
+	pearl.CanCollide = false
+end
+
+local function buildCoralProp(model: Model, base: CFrame, color: Color3)
+	local offsets = { Vector3.new(-3, 0, 0), Vector3.new(0, 0, -1.5), Vector3.new(3, 0, 0.5), Vector3.new(-1, 0, 2) }
+	for i, offset in offsets do
+		local height = 5 + (i % 3) * 2
+		local tilt = CFrame.Angles(math.rad((i - 2.5) * 9), 0, math.rad((i % 2) * 14 - 7))
+		local stem = base * CFrame.new(offset) * tilt * CFrame.new(0, height / 2 + 0.3, 0)
+		propPart(model, "Branch", Vector3.new(height, 1.1, 1.1), stem * CFrame.Angles(0, 0, math.rad(90)), color, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder)
+		propPart(model, "Bud", Vector3.new(1.9, 1.9, 1.9), stem * CFrame.new(0, height / 2, 0), color:Lerp(Color3.new(1, 1, 1), 0.35), Enum.Material.SmoothPlastic, Enum.PartType.Ball)
 	end
-	return model
 end
 
--- Central plaza: a raised disc with a border of pearls and the spawn just south of centre.
+local function buildKelpProp(model: Model, base: CFrame, color: Color3)
+	for _, x in { -3, 3 } do
+		local vat = propPart(model, "Vat", Vector3.new(7, 4.5, 4.5), base * CFrame.new(x, 3.8, 0) * CFrame.Angles(0, 0, math.rad(90)), Color3.fromRGB(170, 220, 255), Enum.Material.Glass, Enum.PartType.Cylinder)
+		vat.Transparency = 0.5
+		propPart(model, "Kelp", Vector3.new(0.6, 5.5, 0.3), base * CFrame.new(x, 3.6, 0), color, Enum.Material.SmoothPlastic)
+	end
+	propPart(model, "Chimney", Vector3.new(1.6, 9, 1.6), base * CFrame.new(0, 4.8, -2.6), Color3.fromRGB(110, 120, 130), Enum.Material.Metal)
+end
+
+local function buildVaultProp(model: Model, base: CFrame, color: Color3)
+	propPart(model, "Vault", Vector3.new(9, 7, 6), base * CFrame.new(0, 3.8, -0.5), Color3.fromRGB(120, 125, 135), Enum.Material.DiamondPlate)
+	propPart(model, "Door", Vector3.new(0.4, 5, 5), base * CFrame.new(0, 3.8, 2.75) * CFrame.Angles(0, math.rad(90), 0), color, Enum.Material.Foil, Enum.PartType.Cylinder)
+	for i = 1, 5 do
+		local a = i * 1.3
+		propPart(model, "Coin", Vector3.new(1.4, 1.4, 1.4), base * CFrame.new(math.cos(a) * 3.8, 0.9, 3.2 + math.sin(a) * 0.6), color, Enum.Material.Foil, Enum.PartType.Ball)
+	end
+end
+
+local function buildKrakenProp(model: Model, base: CFrame, color: Color3)
+	propPart(model, "Dome", Vector3.new(8, 8, 8), base * CFrame.new(0, 4.3, 0), color, Enum.Material.SmoothPlastic, Enum.PartType.Ball)
+	for i = 0, 3 do
+		local a = math.rad(i * 90 + 45)
+		local tentacle = base * CFrame.new(math.cos(a) * 4.6, 1.6, math.sin(a) * 4.6) * CFrame.Angles(0, -a, math.rad(35))
+		propPart(model, "Tentacle", Vector3.new(6, 1.2, 1.2), tentacle, color:Lerp(Color3.new(0, 0, 0), 0.15), Enum.Material.SmoothPlastic, Enum.PartType.Cylinder)
+	end
+	for _, x in { -1.6, 1.6 } do
+		propPart(model, "Eye", Vector3.new(1.4, 1.4, 1.4), base * CFrame.new(x, 6, 3.5), Color3.fromRGB(255, 255, 255), Enum.Material.Neon, Enum.PartType.Ball)
+	end
+end
+
+local PROP_BUILDERS: { [string]: (Model, CFrame, Color3) -> () } = {
+	PearlClam = buildClamProp,
+	CoralFarm = buildCoralProp,
+	KelpFactory = buildKelpProp,
+	SunkenVault = buildVaultProp,
+	KrakenDen = buildKrakenProp,
+}
+
+local function buildStand(plot: StandPlot, parent: Instance)
+	local def = Economy.STAND_BY_ID[plot.standId]
+	local model = Instance.new("Model")
+	model.Name = plot.standId
+	local floor = Stations.SEA_FLOOR_TOP
+	local center = Vector3.new(plot.center.X, floor, plot.center.Z)
+	-- Local frame: -Z of `facing` points at the plaza.
+	local facing = CFrame.lookAt(center, center + plot.forward)
+	local base = disc("Base", center, 16, 0.4, floor + 0.3, MARBLE, Enum.Material.Marble, model)
+	model.PrimaryPart = base
+
+	-- Prop sits behind the counter. Built in a frame rotated so +Z faces the plaza.
+	local propFrame = facing * CFrame.new(0, 0.3, 1.5) * CFrame.Angles(0, math.pi, 0)
+	local builder = PROP_BUILDERS[plot.standId]
+	if builder then
+		builder(model, propFrame, plot.color)
+	end
+	propPart(model, "Counter", Vector3.new(10, 2.6, 2.4), facing * CFrame.new(0, 0.3 + 1.3, -4.5), Color3.fromRGB(150, 105, 70), Enum.Material.Wood)
+	propPart(model, "CounterTop", Vector3.new(10.4, 0.3, 2.8), facing * CFrame.new(0, 0.3 + 2.6 + 0.15, -4.5), plot.color, Enum.Material.SmoothPlastic)
+
+	-- Sign post behind the prop, with the stand name and a client-filled info row.
+	local post = propPart(model, "SignPost", Vector3.new(1, 10, 1), facing * CFrame.new(0, 0.3 + 5, 6.5), MARBLE, Enum.Material.Marble)
+	titleBillboard(post, def.name, 7.5, true, 260, 110)
+	model.Parent = parent
+end
+
+-- ===== Plaza, paths, temple =====
+
 local function buildPlaza(parent: Instance)
 	local folder = Instance.new("Folder")
 	folder.Name = "Plaza"
-	disc("PlazaFloor", Vector3.zero, Stations.PLAZA_RADIUS * 2, 0.4, 0.4, PLAZA_COLOR, Enum.Material.Limestone, folder)
-	local count = 40
+	disc("PlazaFloor", Vector3.zero, Stations.PLAZA_RADIUS * 2, 0.4, Stations.PLAZA_TOP, PLAZA_COLOR, Enum.Material.Limestone, folder)
+	local count = 36
 	local r = Stations.PLAZA_RADIUS + 1.5
 	for i = 1, count do
 		local a = (i / count) * math.pi * 2
@@ -216,44 +266,68 @@ local function buildPlaza(parent: Instance)
 	folder.Parent = parent
 end
 
--- Stepping-stone walkways: the promenade ring plus the north and south axis lanes.
+-- Stepping stones: the promenade ring plus the lanes to the temple and the stairway.
 -- Stones are spaced apart so none overlap (no coplanar tops).
 local function buildPaths(parent: Instance)
 	local folder = Instance.new("Folder")
 	folder.Name = "Paths"
 	local function stone(position: Vector3, size: number)
-		disc("Stone", position, size, 0.3, 0.3, STONE_COLOR, Enum.Material.Slate, folder, false)
+		disc("Stone", position, size, 0.3, Stations.SEA_FLOOR_TOP + 0.3, STONE_COLOR, Enum.Material.Slate, folder, false)
 	end
-
 	local promenade = Stations.PROMENADE_RADIUS
 	local spacing = 7
 	local count = math.floor(2 * math.pi * promenade / spacing)
-	local corridor = Stations.STAIRWAY.width / 2 + 2
 	for i = 0, count - 1 do
 		local a = (i / count) * math.pi * 2
 		local position = Vector3.new(math.sin(a) * promenade, 0, -math.cos(a) * promenade)
-		-- Skip stones under the stairway lane and where the axis lanes cross (no overlapping stones).
-		local onLane = math.abs(position.X) < (if position.Z < 0 then corridor else Stations.AXIS_HALF_WIDTH)
-		if not onLane then
+		if math.abs(position.X) > 4 or position.Z > 0 then -- leave the north lane crossing to the lane stones
 			stone(position, 4.2)
 		end
 	end
-
-	local plazaEdge = Stations.PLAZA_RADIUS + 5
-	-- North lane: plaza to the stairway base.
-	local z = -plazaEdge
+	-- Plaza to the perk pads in front of the temple.
+	local z = -(Stations.PLAZA_RADIUS + 5)
+	local perkEdge = Stations.TEMPLE_CENTER.Z + 18 + 6
+	while z > perkEdge do
+		stone(Vector3.new(0, 0, z), 5)
+		z -= spacing
+	end
+	-- Behind the altar to the stairway base.
+	z = Stations.TEMPLE_CENTER.Z - 12
 	while z > Stations.STAIRWAY.baseZ + 6 do
 		stone(Vector3.new(0, 0, z), 5)
 		z -= spacing
 	end
-	-- South lane: plaza to the Evolution Altar.
-	local altarStart = Stations.ALTAR_RADIUS - 14
-	z = plazaEdge
-	while z < altarStart do
-		stone(Vector3.new(0, 0, z), 5)
-		z += spacing
-	end
 	folder.Parent = parent
+end
+
+local function buildTemple(parent: Instance)
+	local model = Instance.new("Model")
+	model.Name = "EvolutionTemple"
+	local center = Stations.TEMPLE_CENTER
+	local floor = Stations.SEA_FLOOR_TOP
+	local base = disc("TempleBase", center, 14, 0.5, floor + 0.3, MARBLE, Enum.Material.Marble, model)
+	model.PrimaryPart = base
+	for i = 0, 5 do
+		local a = math.rad(i * 60 + 30)
+		local foot = center + Vector3.new(math.cos(a) * 5.5, 0, math.sin(a) * 5.5)
+		part({ name = "Pillar", size = Vector3.new(1.4, 9, 1.4), cframe = CFrame.new(foot.X, floor + 0.3 + 4.5, foot.Z), color = Color3.fromRGB(170, 130, 230), material = Enum.Material.Marble, parent = model })
+	end
+	local crystal = part({
+		name = "Crystal",
+		size = Vector3.new(4, 4, 4),
+		cframe = CFrame.new(center.X, floor + 7, center.Z) * CFrame.Angles(math.rad(45), 0, math.rad(45)),
+		color = Color3.fromRGB(200, 140, 255),
+		material = Enum.Material.Neon,
+		collide = false,
+		parent = model,
+	})
+	local light = Instance.new("PointLight")
+	light.Color = Color3.fromRGB(200, 140, 255)
+	light.Range = 18
+	light.Brightness = 1.5
+	light.Parent = crystal
+	titleBillboard(crystal, "Evolution Temple", 5, true, 260, 110)
+	model.Parent = parent
 end
 
 local function buildStairway(parent: Instance)
@@ -347,10 +421,11 @@ function ArenaService.init()
 	if existing then
 		existing:Destroy()
 	end
+	removeTemplateParts()
 	local arena = Instance.new("Folder")
 	arena.Name = ARENA_NAME
 
-	disc("SeaFloor", Vector3.zero, Stations.FLOOR_RADIUS * 2, 4, 0, Color3.fromRGB(214, 196, 150), Enum.Material.Sand, arena)
+	disc("SeaFloor", Vector3.zero, Stations.FLOOR_RADIUS * 2, 4, Stations.SEA_FLOOR_TOP, Color3.fromRGB(214, 196, 150), Enum.Material.Sand, arena)
 
 	-- Invisible boundary ring (24 segments), open to the north where the stairway leaves.
 	local segments = 24
@@ -387,13 +462,17 @@ function ArenaService.init()
 
 	buildPlaza(arena)
 	buildPaths(arena)
+	buildTemple(arena)
 
 	local spawn = Instance.new("SpawnLocation")
 	spawn.Name = "Spawn"
 	spawn.Anchored = true
 	spawn.Size = Vector3.new(8, 0.4, 8)
-	-- Sits on the plaza (top 0.4) with its own top at 0.8. Faces north toward the centre clam.
-	spawn.CFrame = CFrame.lookAt(Stations.SPAWN_POSITION + Vector3.new(0, 0.6, 0), Vector3.new(0, 0.6, -100))
+	-- Sits on the plaza (top 0.4) with its own top at 0.8, facing the first stand.
+	local spawnPos = Stations.SPAWN_POSITION + Vector3.new(0, 0.6, 0)
+	local firstStand = Stations.PLOT_BY_STAND[Economy.STARTING_STAND]
+	local lookTarget = if firstStand then Vector3.new(firstStand.center.X, spawnPos.Y, firstStand.center.Z) else spawnPos + Vector3.new(0, 0, -10)
+	spawn.CFrame = CFrame.lookAt(spawnPos, lookTarget)
 	spawn.Neutral = true
 	spawn.Duration = 0
 	spawn.Material = Enum.Material.SmoothPlastic
@@ -406,17 +485,18 @@ function ArenaService.init()
 		decal:Destroy()
 	end
 
+	local standsFolder = Instance.new("Folder")
+	standsFolder.Name = "Stands"
+	standsFolder.Parent = arena
+	for _, plot in Stations.PLOTS do
+		buildStand(plot, standsFolder)
+	end
+
 	local stationsFolder = Instance.new("Folder")
 	stationsFolder.Name = "Stations"
 	stationsFolder.Parent = arena
 	for _, station in Stations.LIST do
-		if station.kind == "Clam" then
-			buildClam(station, stationsFolder)
-		elseif station.kind == "Evolution" then
-			buildAltar(station, stationsFolder)
-		else
-			buildPad(station, stationsFolder)
-		end
+		buildPad(station, stationsFolder)
 	end
 
 	buildStairway(arena)
@@ -436,7 +516,7 @@ function ArenaService.isNear(player: Player, station: StationDef): boolean
 	end
 	local offset = root.Position - station.position
 	local horizontal = Vector3.new(offset.X, 0, offset.Z).Magnitude
-	return horizontal <= station.radius + Stations.PROXIMITY_TOLERANCE
+	return horizontal <= station.promptRadius + Stations.PROXIMITY_TOLERANCE
 		and math.abs(offset.Y) <= Stations.VERTICAL_TOLERANCE
 end
 

@@ -1,5 +1,5 @@
 --!strict
--- Example limited-time event: warmer palette, +25% income, Coral Reefs produce x2.
+-- Example limited-time event: warmer palette, +25% income, Coral Farms produce x2.
 
 local Types = require(script.Parent.Parent.Parent.Types)
 
@@ -12,9 +12,8 @@ local season: Types.SeasonDefinition = {
 	endsAt = 1799712000, -- 2027-01-12 00:00 UTC
 	economy = {
 		incomeMultiplier = 1.25,
-		clickMultiplier = 1,
 		costMultiplier = 1,
-		generatorMultipliers = { Reef = 2 },
+		standMultipliers = { CoralFarm = 2 },
 	},
 	theme = {
 		waterTint = Color3.fromRGB(255, 200, 230),

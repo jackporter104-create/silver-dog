@@ -6,7 +6,6 @@
 	  display = currency + rate * (serverNow - serverTime)
 	Server time comes from Workspace:GetServerTimeNow() on both sides, so the client clock
 	is never trusted. Extrapolation is capped so dropped ticks cannot run away.
-	Local click predictions show instant feedback and are discarded on the next authoritative tick.
 ]]
 
 local Workspace = game:GetService("Workspace")
@@ -25,15 +24,15 @@ local StateController = {}
 local MAX_EXTRAPOLATION = 2.5
 
 local baseCurrency: BigNumber = BigNumber.ZERO
-local predicted: BigNumber = BigNumber.ZERO
 local rate: BigNumber = BigNumber.ZERO
 local baseTime = 0
-local charge = 0
+local buffMultiplier = 1
 local snapshot: Types.Snapshot? = nil
 
 StateController.snapshotChanged = Signal.new() :: Signal.Signal<Types.Snapshot>
 StateController.notified = Signal.new() :: Signal.Signal<Types.Notification>
 StateController.uiConfigChanged = Signal.new() :: Signal.Signal<Types.UiConfig>
+StateController.cycleStarted = Signal.new() :: Signal.Signal<Types.CycleEvent>
 
 function StateController.big(value: BigNumber.Serialized?): BigNumber
 	return BigNumber.deserialize(value) or BigNumber.ZERO
@@ -61,8 +60,7 @@ local function onTick(payload: unknown)
 	if p[5] < baseTime then
 		return
 	end
-	baseCurrency, rate, baseTime, charge = currency, newRate, p[5], p[6]
-	predicted = BigNumber.ZERO
+	baseCurrency, rate, baseTime, buffMultiplier = currency, newRate, p[5], p[6]
 end
 
 local function onSnapshot(payload: unknown)
@@ -77,8 +75,7 @@ local function onSnapshot(payload: unknown)
 	baseCurrency = StateController.big(snap.currency)
 	rate = StateController.big(snap.rate)
 	baseTime = math.max(baseTime, snap.serverTime)
-	charge = snap.autoClicker.charge
-	predicted = BigNumber.ZERO
+	buffMultiplier = snap.globalMultiplier
 	StateController.snapshotChanged:Fire(snap)
 end
 
@@ -86,6 +83,11 @@ function StateController.init()
 	local remotes = Net.get()
 	remotes.Tick.OnClientEvent:Connect(onTick)
 	remotes.Snapshot.OnClientEvent:Connect(onSnapshot)
+	remotes.Cycle.OnClientEvent:Connect(function(payload: unknown)
+		if typeof(payload) == "table" and typeof((payload :: any).standId) == "string" and typeof((payload :: any).endsAt) == "number" then
+			StateController.cycleStarted:Fire(payload :: Types.CycleEvent)
+		end
+	end)
 	remotes.Notify.OnClientEvent:Connect(function(payload: unknown)
 		if typeof(payload) == "table" and typeof((payload :: any).text) == "string" then
 			StateController.notified:Fire(payload :: Types.Notification)
@@ -102,7 +104,7 @@ end
 
 function StateController.displayCurrency(): BigNumber
 	local elapsed = math.clamp(Workspace:GetServerTimeNow() - baseTime, 0, MAX_EXTRAPOLATION)
-	local value = BigNumber.add(baseCurrency, predicted)
+	local value = baseCurrency
 	if rate.m > 0 and elapsed > 0 then
 		value = BigNumber.add(value, BigNumber.mulNumber(rate, elapsed))
 	end
@@ -113,23 +115,21 @@ function StateController.rate(): BigNumber
 	return rate
 end
 
-function StateController.charge(): number
-	return charge
+function StateController.globalMultiplier(): number
+	return buffMultiplier
+end
+
+-- Seconds left until `remaining` (relative to the last snapshot) runs out.
+function StateController.remaining(remaining: number): number
+	local snap = snapshot
+	if not snap then
+		return 0
+	end
+	return math.max(0, remaining - (Workspace:GetServerTimeNow() - snap.serverTime))
 end
 
 function StateController.snapshot(): Types.Snapshot?
 	return snapshot
-end
-
--- Optimistic click feedback. The next tick replaces it with the authoritative balance.
-function StateController.predictClick(): BigNumber
-	local snap = snapshot
-	if not snap then
-		return BigNumber.ZERO
-	end
-	local value = StateController.big(snap.clickValue)
-	predicted = BigNumber.add(predicted, value)
-	return value
 end
 
 return StateController
