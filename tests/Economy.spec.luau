@@ -35,6 +35,7 @@ local function newData(): Types.PlayerData
 		statues = {},
 		lastOnline = 0,
 		totalRuns = 0,
+		starterPackClaimed = false,
 		receipts = {},
 	}
 end
@@ -142,6 +143,28 @@ check("buff pad hidden until unlocked", not EconomyMath.isPadVisible(r, "Buff", 
 r.buffs.TidalRush = { unlocked = true, activeUntil = 0, readyAt = 0 }
 check("buff pad shown once unlocked", EconomyMath.isPadVisible(r, "Buff", "TidalRush"))
 check("hub pads always visible", EconomyMath.isPadVisible(r, "Evolve", "GoldenTouch") and EconomyMath.isPadVisible(r, "Statue", "ClamColossus"))
+
+-- Monetization: x2 Income, Auto-Collect, Time Warp, Starter Pack
+local m = newData()
+local x2: Types.Entitlements = { doubleIncome = true, autoCollect = false }
+local auto: Types.Entitlements = { doubleIncome = false, autoCollect = true }
+check("x2 Income doubles cycle value", approx(EconomyMath.standCycleValue(m, clam, MODS, x2, 1), 2))
+check("no auto-collect without pass", BigNumber.isZero(EconomyMath.autoCollectRate(m, MODS, ENT, 1)))
+check("auto-collect runs unmanaged stand at hand rate", approx(EconomyMath.autoCollectRate(m, MODS, auto, 1), 1))
+check("auto-collect is passive income", approx(EconomyMath.passiveRate(m, MODS, auto, 1), 1))
+m.stands.PearlClam.managerHired = true
+check("managed stand not double counted", BigNumber.isZero(EconomyMath.autoCollectRate(m, MODS, auto, 1)) and approx(EconomyMath.passiveRate(m, MODS, auto, 1), 1))
+check("auto-collect flag", not EconomyMath.isAutoCollected(m, "PearlClam", auto))
+m.stands.PearlClam.managerHired = false
+check("time warp = 4h", EconomyMath.timeWarpSeconds() == 4 * 3600)
+check("time warp falls back to hand rate", approx(EconomyMath.timeWarpEarnings(m, MODS, ENT, 3600), 3600))
+m.stands.PearlClam.managerHired = true
+m.stands.PearlClam.multiplier = 2
+check("time warp uses passive rate, no offline cap", approx(EconomyMath.timeWarpEarnings(m, MODS, ENT, 20 * 3600), 4 * 20 * 3600))
+check("starter pack base at evo 1", approx(EconomyMath.starterPackAmount(newData(), MODS, ENT), 250_000))
+local late = newData()
+late.evolution.level = 3
+check("starter pack scales with evolution", approx(EconomyMath.starterPackAmount(late, MODS, ENT), 250_000 * 42 ^ 2))
 
 -- Dev command amount parsing
 local function parses(text: string, expected: BigNumber.BigNumber)

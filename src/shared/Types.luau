@@ -39,12 +39,14 @@ export type PlayerData = {
 	statues: { [string]: boolean },
 	lastOnline: number, -- server os.time()
 	totalRuns: number, -- manual stand cycles
+	starterPackClaimed: boolean, -- one-time developer product
 	receipts: { [string]: number }, -- processed developer-product purchase ids -> os.time()
 }
 
 -- Monetization flags resolved live (never trusted from saved data).
 export type Entitlements = {
-	doubleIncome: boolean,
+	doubleIncome: boolean, -- x2 Income gamepass
+	autoCollect: boolean, -- Auto-Collect gamepass
 }
 
 -- Season or event economy overrides. 1 = neutral.
@@ -76,7 +78,7 @@ export type SeasonDefinition = {
 	theme: SeasonTheme,
 }
 
-export type StationKind = "Deed" | "StandMain" | "Multiplier" | "Speed" | "Manager" | "Buff" | "Evolve" | "Statue"
+export type StationKind = "Deed" | "StandMain" | "Multiplier" | "Speed" | "Manager" | "Buff" | "Evolve" | "Statue" | "Shop"
 
 -- ===== Network payloads (server -> client) =====
 
@@ -92,6 +94,7 @@ export type StationView = {
 export type StandView = {
 	owned: boolean,
 	managed: boolean,
+	autoCollected: boolean, -- runs by itself through the Auto-Collect gamepass (owned, unmanaged)
 	multiplier: number,
 	speed: number,
 	interval: number, -- seconds per cycle
@@ -129,6 +132,8 @@ export type Snapshot = {
 	statues: { [string]: boolean },
 	stairwayUnlocked: boolean,
 	seasonId: string,
+	entitlements: Entitlements,
+	starterPackClaimed: boolean,
 }
 
 -- Sent when a hand-run cycle starts, so the client can animate it.

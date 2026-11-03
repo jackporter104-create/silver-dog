@@ -38,6 +38,7 @@ export type SavedData = {
 	statues: { [string]: boolean },
 	lastOnline: number,
 	totalRuns: number,
+	starterPackClaimed: boolean,
 	receipts: { [string]: number },
 }
 
@@ -58,6 +59,7 @@ function DataSchema.default(): PlayerData
 		statues = {},
 		lastOnline = 0,
 		totalRuns = 0,
+		starterPackClaimed = false,
 		receipts = {},
 	}
 end
@@ -119,6 +121,7 @@ function DataSchema.fromSaved(raw: unknown): (PlayerData, { string })
 		-- v1 used a different economy. Start fresh, keep all-time stats and receipts.
 		table.insert(repairs, "migrated from v" .. tostring(t.version))
 		data.totalEarned = readBig(t.totalEarned, "totalEarned", repairs)
+		data.starterPackClaimed = t.starterPackClaimed == true
 		readReceipts(t.receipts, data)
 		return data, repairs
 	end
@@ -129,6 +132,7 @@ function DataSchema.fromSaved(raw: unknown): (PlayerData, { string })
 	data.bestCurrency = BigNumber.max(readBig(t.bestCurrency, "bestCurrency", repairs), data.currency)
 	data.lastOnline = readInteger(t.lastOnline, 0, MAX_INTEGER, 0, "lastOnline", repairs)
 	data.totalRuns = readInteger(t.totalRuns, 0, MAX_INTEGER, 0, "totalRuns", repairs)
+	data.starterPackClaimed = t.starterPackClaimed == true
 
 	local stands = asTable(t.stands)
 	if stands then
@@ -239,6 +243,7 @@ function DataSchema.toSaved(data: PlayerData): SavedData
 		statues = table.clone(data.statues),
 		lastOnline = data.lastOnline,
 		totalRuns = data.totalRuns,
+		starterPackClaimed = data.starterPackClaimed,
 		receipts = pruneReceipts(data.receipts),
 	}
 end
@@ -260,6 +265,9 @@ function DataSchema.validateSaved(saved: SavedData): (boolean, string?)
 	end
 	if not isInteger(saved.lastOnline, 0, MAX_INTEGER) or not isInteger(saved.totalRuns, 0, MAX_INTEGER) then
 		return false, "counters"
+	end
+	if typeof(saved.starterPackClaimed) ~= "boolean" then
+		return false, "starterPackClaimed"
 	end
 	for id, s in saved.stands do
 		if not Economy.STAND_BY_ID[id] then

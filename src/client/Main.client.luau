@@ -4,10 +4,12 @@
 local Controllers = script.Parent.Controllers
 local StateController = require(Controllers.StateController)
 local StationController = require(Controllers.StationController)
+local StandTracker = require(Controllers.StandTracker)
 local WorldController = require(Controllers.WorldController)
 local HudController = require(script.Parent.UI.HudController)
 local OceanSpawner = require(script.Parent.Ocean.OceanSpawner)
 
+StandTracker.init()
 HudController.init()
 OceanSpawner.init()
 WorldController.init()

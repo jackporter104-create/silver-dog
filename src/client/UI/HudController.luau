@@ -1,12 +1,16 @@
 --!strict
 --[[
-	HudController: the oceanic HUD, built in code (no external assets). Information only:
-	there are NO purchase buttons. Everything is bought by stepping on floor pads (or pressing E).
+	HudController: the oceanic HUD, built in code (no external assets). The world has no 3D text:
+	every name, price and prompt is shown here. There are NO purchase buttons: upgrades are bought by
+	stepping on floor pads (or pressing E), and Robux items only in the Shell Shop panel, which opens
+	when you step on the Shop pad in your plaza.
+	  * Zone banner: "Your Reef", "<Name>'s Reef" or "Ocean Hub" as you walk around.
 	  * Currency pill: balance (extrapolated every frame) and managed income per second.
 	  * Evolution badge, and a status panel with stands owned, managers and the active buff.
 	  * Context prompt for the nearest of the player's OWN pads (or a shared Hub pad), e.g.
 	    "[E] Buy Multiplier x16 - Cost: 1.5K", plus that stand's income while you are near it.
 	    A "???" Deed pad reads "[E] Unlock Next Business - Cost: X" and never reveals the stand.
+	    Stand pads also show the current cycle progress. "+value" pops rise from the currency pill.
 	Restyled live by UiConfig (A/B variants and live overrides). The client does no economy math:
 	it only formats and compares values the server sent.
 ]]
@@ -30,7 +34,9 @@ local Experiments = require(Shared.Config.Experiments)
 
 local StateController = require(script.Parent.Parent.Controllers.StateController)
 local StationController = require(script.Parent.Parent.Controllers.StationController)
+local StandTracker = require(script.Parent.Parent.Controllers.StandTracker)
 local Theme = require(script.Parent.Theme)
+local ShopPanel = require(script.Parent.ShopPanel)
 
 type BigNumber = BigNumber.BigNumber
 type StationDef = Stations.StationDef
@@ -62,7 +68,14 @@ local promptAction: TextLabel
 local promptStand: TextLabel
 local holdFill: Frame
 local holdTrack: Frame
+local cycleFill: Frame
+local cycleTrack: Frame
 local toastList: Frame
+local zoneBanner: TextLabel
+local currencyPill: Frame
+local popupCount = 0
+local lastPopupAt = 0
+local MAX_POPUPS = 6
 
 local function accentStroke(thickness: number): UIStroke
 	local stroke = Theme.stroke(uiConfig.accentColor, thickness, 0.1)
@@ -152,13 +165,29 @@ local function buildStatus()
 end
 
 local function buildPrompt()
-	prompt = panel({ Name = "Prompt", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -18), Size = UDim2.fromOffset(560, 132), Visible = false, Parent = gui })
+	prompt = panel({ Name = "Prompt", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -18), Size = UDim2.fromOffset(560, 148), Visible = false, Parent = gui })
 	promptTitle = Theme.label({ Position = UDim2.fromOffset(16, 8), Size = UDim2.new(1, -32, 0, 34), Text = "", Parent = prompt })
 	promptAction = Theme.label({ Position = UDim2.fromOffset(16, 46), Size = UDim2.new(1, -32, 0, 32), Text = "", TextColor3 = C.success, Parent = prompt })
 	promptStand = Theme.label({ Position = UDim2.fromOffset(16, 84), Size = UDim2.new(1, -32, 0, 22), Text = "", Font = Theme.FONT_BODY, TextColor3 = C.muted, Parent = prompt })
 	holdFill = bar(prompt, UDim2.new(0, 16, 1, -18), UDim2.new(1, -32, 0, 8), Color3.fromRGB(200, 120, 255))
 	holdTrack = holdFill.Parent :: Frame
 	holdTrack.Visible = false
+	cycleFill = bar(prompt, UDim2.fromOffset(16, 112), UDim2.new(1, -32, 0, 10), C.gold)
+	cycleTrack = cycleFill.Parent :: Frame
+	cycleTrack.Visible = false
+end
+
+local function buildBanner()
+	zoneBanner = Theme.label({
+		Name = "ZoneBanner",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 124),
+		Size = UDim2.fromOffset(420, 34),
+		Text = "",
+		TextColor3 = C.foam,
+		TextStrokeTransparency = 0.3,
+		Parent = gui,
+	})
 end
 
 local function buildToasts()
@@ -218,11 +247,15 @@ local function actionText(station: StationDef, snap: Types.Snapshot, currency: B
 	local kind = station.kind
 	local standDef = Economy.STAND_BY_ID[station.target or ""]
 	local stand = snap.stands[station.target or ""]
-	if kind == "Deed" then
+	if kind == "Shop" then
+		return inputHint() .. "Open the Shell Shop", C.gold
+	elseif kind == "Deed" then
 		return costLine("Unlock Next Business", StateController.big(view.cost), currency)
 	elseif kind == "StandMain" and standDef and stand then
 		if stand.managed then
 			return standDef.managerName .. " is running this stand", C.success
+		elseif stand.autoCollected then
+			return "Auto-Collect is running this stand for you", C.success
 		end
 		return string.format("Stand here to run: +%s every %.2gs", fmt(StateController.big(stand.manualValue)), math.max(stand.interval, Economy.MIN_MANUAL_INTERVAL)), C.gold
 	elseif kind == "Buff" then
@@ -279,7 +312,9 @@ end
 
 local function titleFor(station: StationDef): string
 	local kind: string = station.kind
-	if kind == "Deed" then
+	if kind == "Shop" then
+		return "Shell Shop"
+	elseif kind == "Deed" then
 		return "??? Mystery Business"
 	elseif kind == "Evolve" then
 		return "Evolution Temple"
@@ -305,15 +340,48 @@ local function standLine(station: StationDef, snap: Types.Snapshot): string
 	end
 	local def = Economy.STAND_BY_ID[standId]
 	local rate = StateController.big(stand.rate)
-	local how = if stand.managed then "managed" else "by hand"
+	local how = if stand.managed then "managed" elseif stand.autoCollected then "Auto-Collect" else "by hand"
 	return string.format("%s income: %s (%s) • x%s value • %.2gs cycle", def.name, NumberFormat.formatRate(rate), how, fmt(BigNumber.pow(BigNumber.fromNumber(2), stand.multiplier)), stand.interval)
+end
+
+local function rootPosition(): Vector3?
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	return if root and root:IsA("BasePart") then root.Position else nil
+end
+
+-- The stairway barrier has no 3D text, so its requirement is shown here when you walk up to it.
+local function stairwayHint(snap: Types.Snapshot): boolean
+	local position = rootPosition()
+	if snap.stairwayUnlocked or not position then
+		return false
+	end
+	local base = Vector3.new(0, position.Y, Stations.STAIRWAY.baseZ)
+	if (position - base).Magnitude > 14 then
+		return false
+	end
+	local cfg = Statues.STAIRWAY
+	promptTitle.Text = "Heavenly Stairway"
+	promptAction.Text = string.format("Locked: reach Evolution %d and hold %s", cfg.requiredEvolution, fmt(BigNumber.fromExponent(cfg.requiredBestExponent)))
+	promptAction.TextColor3 = C.locked
+	promptStand.Text = "Golden statues with colossal multipliers wait at the top"
+	return true
 end
 
 local function refreshPrompt(currency: BigNumber)
 	local station = StationController.nearest()
 	local snap = StateController.snapshot()
-	if not station or not snap then
+	if ShopPanel.isOpen() and (not station or station.kind ~= "Shop") then
+		ShopPanel.close()
+	end
+	cycleTrack.Visible = false
+	holdTrack.Visible = false
+	if not snap then
 		prompt.Visible = false
+		return
+	end
+	if not station then
+		prompt.Visible = stairwayHint(snap)
 		return
 	end
 	prompt.Visible = true
@@ -322,9 +390,85 @@ local function refreshPrompt(currency: BigNumber)
 	promptAction.Text = text
 	promptAction.TextColor3 = color
 	promptStand.Text = standLine(station, snap)
+	local progress = if station.stand then StandTracker.progress(station.stand) else nil
+	if progress then
+		cycleTrack.Visible = true
+		cycleFill.Size = UDim2.fromScale(progress, 1)
+	end
 	local hold = StationController.evolveHoldProgress()
 	holdFill.Size = UDim2.fromScale(hold, 1)
 	holdTrack.Visible = hold > 0
+end
+
+-- "+value" rising from the currency pill on every payout (throttled).
+local function payoutPopup(payout: StandTracker.Payout)
+	local now = os.clock()
+	if popupCount >= MAX_POPUPS or now - lastPopupAt < 0.2 then
+		return
+	end
+	lastPopupAt = now
+	popupCount += 1
+	local label = Theme.label({
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, math.random(-140, 140), 0, 112),
+		Size = UDim2.fromOffset(170, 34),
+		Text = "+" .. fmt(payout.value),
+		TextColor3 = C.gold,
+		TextStrokeTransparency = 0.3,
+		Parent = gui,
+	})
+	local rise = TweenService:Create(label, TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Position = label.Position - UDim2.fromOffset(0, 60),
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
+	})
+	rise:Play()
+	rise.Completed:Connect(function()
+		label:Destroy()
+		popupCount -= 1
+	end)
+	-- A little bump on the pill.
+	local pillScale = currencyPill:FindFirstChildOfClass("UIScale")
+	if pillScale then
+		pillScale.Scale = 1.05
+		TweenService:Create(pillScale, TweenInfo.new(0.25, Enum.EasingStyle.Back), { Scale = 1 }):Play()
+	end
+end
+
+local function zoneLabel(): string
+	local position = rootPosition()
+	if not position then
+		return ""
+	end
+	local flat = Vector3.new(position.X, 0, position.Z)
+	if flat.Magnitude <= Stations.HUB_RADIUS + 4 or position.Y > 8 then
+		return "Ocean Hub"
+	end
+	local index = Stations.zoneAt(position)
+	if not index then
+		return ""
+	end
+	if player:GetAttribute("ZoneIndex") == index then
+		return "Your Reef"
+	end
+	local arena = Workspace:FindFirstChild("OceanArena")
+	local zones = arena and arena:FindFirstChild("Zones")
+	local zone = zones and zones:FindFirstChild("Zone" .. index)
+	local owner = zone and zone:GetAttribute("OwnerName")
+	if typeof(owner) == "string" and owner ~= "" then
+		return owner .. "'s Reef"
+	end
+	return "Empty Reef"
+end
+
+local function refreshBanner()
+	local text = zoneLabel()
+	if text == zoneBanner.Text then
+		return
+	end
+	zoneBanner.Text = text
+	zoneBanner.TextTransparency = 1
+	TweenService:Create(zoneBanner, TweenInfo.new(0.4), { TextTransparency = 0 }):Play()
 end
 
 local function onSnapshot(snap: Types.Snapshot)
@@ -433,7 +577,17 @@ function HudController.init()
 	buildEvolution()
 	buildStatus()
 	buildPrompt()
+	buildBanner()
 	buildToasts()
+	ShopPanel.init(gui)
+	currencyPill = gui:FindFirstChild("Currency") :: Frame
+	local pillScale = Instance.new("UIScale")
+	pillScale.Parent = currencyPill
+
+	StationController.shopRequested:Connect(function()
+		ShopPanel.open()
+	end)
+	StandTracker.payout:Connect(payoutPopup)
 
 	StateController.snapshotChanged:Connect(onSnapshot)
 	StateController.notified:Connect(function(n: Types.Notification)
@@ -455,6 +609,7 @@ function HudController.init()
 	task.spawn(function()
 		while true do
 			refreshBuff()
+			refreshBanner()
 			task.wait(0.25)
 		end
 	end)

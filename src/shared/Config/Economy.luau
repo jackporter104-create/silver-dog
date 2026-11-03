@@ -160,9 +160,6 @@ Economy.OFFLINE = {
 	minSeconds = 60, -- ignore tiny gaps (rejoins)
 }
 
--- Time Warp developer product: instantly grants this many seconds of managed income.
-Economy.TIME_WARP_SECONDS = 3600
-
 -- Hard sanity limits used by save validation.
 Economy.LIMITS = {
 	maxReceipts = 50,

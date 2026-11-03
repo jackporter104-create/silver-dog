@@ -204,6 +204,19 @@ for i, buff in Economy.BUFFS do
 	})
 end
 
+-- Shell Shop: the plaza edge opposite the Hub path. Opens the shop panel (purchases go through
+-- Roblox prompts and are granted by the server).
+add({
+	id = "Shop",
+	kind = "Shop",
+	displayName = "Shell Shop",
+	scope = "Zone",
+	position = Vector3.new(0, Stations.PLAZA_TOP, 13),
+	radius = 3,
+	promptRadius = 3 + PROMPT_MARGIN,
+	color = Color3.fromRGB(255, 200, 80),
+})
+
 -- Spawn: plaza centre, facing the first stand.
 Stations.SPAWN_LOCAL = Vector3.new(0, Stations.PLAZA_TOP, 0)
 Stations.SPAWN_FACING_LOCAL = plots[1].center
