@@ -1,0 +1,6 @@
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+*.rbxm
+sourcemap.json
+.hoplite/
