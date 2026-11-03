@@ -1,43 +1,43 @@
 --!strict
 --[[
-	Pacing simulator. It drives EconomyMath with a greedy "good player":
-	  * clicks ~2 times/s on average (active play), recharges the auto-clicker whenever it runs dry
-	  * always buys the purchase with the best payback time
-	  * evolves as soon as allowed, buys statues as soon as affordable
-	Reports active-play time to each milestone. Run: python3 tools/run_luau.py tools/sim.luau
+	Pacing simulator for the stand economy. It drives EconomyMath with a greedy "good player":
+	  * hand-runs the best unmanaged stand (MANUAL_EFFICIENCY covers walking and gaps)
+	  * uses the strongest unlocked global buff whenever it is off cooldown (time-averaged)
+	  * always buys the purchase with the best payback time. A deed is valued together with
+	    that stand's manager, because an unmanaged second stand adds nothing while you hand-run another.
+	  * evolves as soon as allowed and buys statues as soon as affordable.
+	Reports active play time to each milestone. Run: python3 tools/run_luau.py tools/sim.luau
 ]]
 
 local BigNumber = require("../shared/BigNumber")
 local NumberFormat = require("../shared/NumberFormat")
 local EconomyMath = require("../shared/EconomyMath")
 local Economy = require("../shared/Config/Economy")
-local Evolution = require("../shared/Config/Evolution")
 local Statues = require("../shared/Config/Statues")
 local Types = require("../shared/Types")
 
 type BigNumber = BigNumber.BigNumber
 
 local MODS = EconomyMath.NEUTRAL_MODIFIERS
-local ENT: Types.Entitlements = { infiniteAutoClicker = false }
-local MANUAL_CPS = 2
+local ENT = EconomyMath.NO_ENTITLEMENTS
+local MANUAL_EFFICIENCY = 0.8
+local MANUAL_GAP = 0.15 -- seconds lost between hand-run cycles
 local MAX_HOURS = 24 * 120
-local PERK_ROTATION = { "RichReefs", "TidalClicks", "RichReefs", "FishFrenzy", "RichReefs", "GoldenInvestors", "RichReefs" }
+local PERK_ROTATION = { "GoldenTouch", "SwiftCurrents", "GoldenTouch", "LongTides", "GoldenTouch", "BusyFins", "GoldenTouch" }
 
 local function newData(): Types.PlayerData
 	return {
-		version = 1,
+		version = Economy.DATA_VERSION,
 		currency = BigNumber.ZERO,
 		lifetimeEarned = BigNumber.ZERO,
 		totalEarned = BigNumber.ZERO,
 		bestCurrency = BigNumber.ZERO,
-		investors = 0,
-		clickLevel = 0,
-		generators = {},
-		autoClicker = { tier = 0, charge = 0 },
+		stands = EconomyMath.startingStands(),
+		buffs = {},
 		evolution = { level = 1, perks = {} },
 		statues = {},
 		lastOnline = 0,
-		totalClicks = 0,
+		totalRuns = 0,
 		receipts = {},
 	}
 end
@@ -59,13 +59,40 @@ end
 local function mark(name: string)
 	if not reached[name] then
 		reached[name] = true
-		table.insert(milestones, string.format("%-34s %s", name, fmtTime(t)))
+		table.insert(milestones, string.format("%-40s %s", name, fmtTime(t)))
 	end
 end
 
+-- Time-averaged multiplier from using the strongest unlocked buff whenever it is ready.
+local function buffAverage(d: Types.PlayerData): number
+	local best = 1
+	for _, def in Economy.BUFFS do
+		if EconomyMath.isBuffMilestoneReached(d, def) then
+			local duration = EconomyMath.buffDuration(d, def)
+			best = math.max(best, 1 + (def.multiplier - 1) * duration / (duration + def.cooldown))
+		end
+	end
+	return best
+end
+
+local function manualRate(d: Types.PlayerData, buff: number): (BigNumber, string?)
+	local best, bestId = BigNumber.ZERO, nil
+	for _, def in Economy.STANDS do
+		if EconomyMath.isOwned(d, def.id) and not EconomyMath.isManaged(d, def.id) then
+			local value = EconomyMath.manualCycleValue(d, def, MODS, ENT, buff)
+			local rate = BigNumber.mulNumber(value, MANUAL_EFFICIENCY / (EconomyMath.manualInterval(d, def) + MANUAL_GAP))
+			if BigNumber.gt(rate, best) then
+				best, bestId = rate, def.id
+			end
+		end
+	end
+	return best, bestId
+end
+
 local function totalRate(d: Types.PlayerData): BigNumber
-	local manual = BigNumber.mulNumber(EconomyMath.clickValue(d, MODS), MANUAL_CPS)
-	return BigNumber.add(EconomyMath.incomePerSecond(d, MODS, ENT), manual)
+	local buff = buffAverage(d)
+	local manual = manualRate(d, buff)
+	return BigNumber.add(EconomyMath.managedRate(d, MODS, ENT, buff), manual)
 end
 
 local function earn(amount: BigNumber)
@@ -75,15 +102,10 @@ local function earn(amount: BigNumber)
 	data.bestCurrency = BigNumber.max(data.bestCurrency, data.currency)
 end
 
--- `simulate` and `valueCost` let a purchase be valued differently than it is applied
--- (an Investor that unlocks a generator is valued together with that generator's first level).
 type Candidate = { name: string, cost: BigNumber, apply: () -> (), simulate: (() -> ())?, valueCost: BigNumber? }
 
 local function deepCopy<T>(value: T): T
-	if type(value) ~= "table" then
-		return value
-	end
-	if table.isfrozen(value :: any) then
+	if type(value) ~= "table" or table.isfrozen(value :: any) then
 		return value
 	end
 	local out = {}
@@ -93,7 +115,6 @@ local function deepCopy<T>(value: T): T
 	return out :: any
 end
 
--- Payback seconds = cost / (rate gain). Locked or useless options return nil.
 local function payback(candidate: Candidate, baseRate: BigNumber): number?
 	local saved = data
 	data = deepCopy(saved)
@@ -108,60 +129,62 @@ local function payback(candidate: Candidate, baseRate: BigNumber): number?
 	return BigNumber.toNumber(BigNumber.div(candidate.valueCost or candidate.cost, gain))
 end
 
+local function stand(id: string): Types.StandState
+	local state = data.stands[id]
+	if not state then
+		state = { level = 0, multiplier = 0, speed = 0, managerHired = false }
+		data.stands[id] = state
+	end
+	return state
+end
+
 local function candidates(): { Candidate }
 	local list: { Candidate } = {}
-	for _, def in Economy.GENERATORS do
-		if data.investors >= def.requiredInvestors then
-			local owned = data.generators[def.id] or 0
+	for _, def in Economy.STANDS do
+		local state = EconomyMath.standState(data, def.id)
+		if state.level == 0 then
+			local deed = EconomyMath.deedCost(def, MODS)
 			table.insert(list, {
-				name = def.id,
-				cost = EconomyMath.generatorCost(def, owned, 1, MODS),
+				name = def.id .. " deed",
+				cost = deed,
+				valueCost = BigNumber.add(deed, EconomyMath.managerCost(def, MODS)),
 				apply = function()
-					data.generators[def.id] = (data.generators[def.id] or 0) + 1
+					stand(def.id).level = 1
+				end,
+				simulate = function()
+					local s = stand(def.id)
+					s.level = 1
+					s.managerHired = true
 				end,
 			})
-		end
-	end
-	table.insert(list, {
-		name = "Click",
-		cost = EconomyMath.clickUpgradeCost(data.clickLevel, 1, MODS),
-		apply = function()
-			data.clickLevel += 1
-		end,
-	})
-	local unlocks: Economy.GeneratorDef? = nil
-	for _, def in Economy.GENERATORS do
-		if def.requiredInvestors == data.investors + 1 then
-			unlocks = def
-		end
-	end
-	local investorCost = EconomyMath.investorCost(data.investors, 1, MODS)
-	table.insert(list, {
-		name = "Investor",
-		cost = investorCost,
-		valueCost = if unlocks then BigNumber.add(investorCost, EconomyMath.generatorCost(unlocks, 0, 1, MODS)) else nil,
-		apply = function()
-			data.investors += 1
-		end,
-		simulate = function()
-			data.investors += 1
-			if unlocks then
-				data.generators[unlocks.id] = math.max(data.generators[unlocks.id] or 0, 1)
+		else
+			table.insert(list, {
+				name = def.id .. " multiplier",
+				cost = EconomyMath.multiplierCost(def, state.multiplier, MODS),
+				apply = function()
+					stand(def.id).multiplier += 1
+				end,
+			})
+			local speedCost = EconomyMath.speedCost(def, state.speed, MODS)
+			if speedCost then
+				table.insert(list, {
+					name = def.id .. " speed",
+					cost = speedCost,
+					apply = function()
+						stand(def.id).speed += 1
+					end,
+				})
 			end
-		end,
-	})
-	local nextTier = data.autoClicker.tier + 1
-	local tierDef = EconomyMath.autoClickerTier(nextTier)
-	local tierCost = EconomyMath.autoClickerTierCost(nextTier, MODS)
-	if tierDef and tierCost and data.evolution.level >= tierDef.requiredEvolution then
-		table.insert(list, {
-			name = "AutoClicker" .. nextTier,
-			cost = tierCost,
-			apply = function()
-				data.autoClicker.tier = nextTier
-				data.autoClicker.charge = tierDef.capacity
-			end,
-		})
+			if not state.managerHired then
+				table.insert(list, {
+					name = def.id .. " manager",
+					cost = EconomyMath.managerCost(def, MODS),
+					apply = function()
+						stand(def.id).managerHired = true
+					end,
+				})
+			end
+		end
 	end
 	return list
 end
@@ -192,7 +215,6 @@ local function evolve()
 	local fresh = newData()
 	fresh.evolution = { level = level, perks = data.evolution.perks }
 	fresh.evolution.perks[perk] = (fresh.evolution.perks[perk] or 0) + 1
-	fresh.autoClicker = { tier = data.autoClicker.tier, charge = EconomyMath.autoClickerCapacity(data) }
 	fresh.statues = data.statues
 	fresh.totalEarned = data.totalEarned
 	fresh.bestCurrency = data.bestCurrency
@@ -212,11 +234,20 @@ local thresholds = {
 	{ "1 Unquinquagintillion (1e156)", BigNumber.fromExponent(156) },
 }
 
-local rechargeCooldown = 0
+local purchases: { [string]: number } = {}
+local TRACE = false
 while t < MAX_HOURS * 3600 do
 	for _, entry in thresholds do
 		if BigNumber.gte(data.totalEarned, entry[2]) then
 			mark("Total earned " .. entry[1])
+		end
+	end
+	for _, def in Economy.STANDS do
+		if data.evolution.level == 1 and EconomyMath.isOwned(data, def.id) then
+			mark("Run 1: own " .. def.name)
+		end
+		if data.evolution.level == 1 and EconomyMath.isManaged(data, def.id) then
+			mark("Run 1: manager for " .. def.name)
 		end
 	end
 	if data.statues.HeartOfTheOcean then
@@ -230,7 +261,6 @@ while t < MAX_HOURS * 3600 do
 		continue
 	end
 
-	-- Greedy purchase
 	local baseRate = totalRate(data)
 	local best: Candidate? = nil
 	local bestPayback = math.huge
@@ -243,33 +273,19 @@ while t < MAX_HOURS * 3600 do
 	if best and BigNumber.gte(data.currency, best.cost) then
 		data.currency = BigNumber.subClamped(data.currency, best.cost)
 		best.apply()
+		purchases[best.name] = (purchases[best.name] or 0) + 1
+		if TRACE and t < 3600 then
+			print(string.format("t=%7.1f %-24s cost=%-8s rate=%s", t, best.name, NumberFormat.format(best.cost), NumberFormat.formatRate(totalRate(data))))
+		end
 		continue
 	end
 
-	-- Advance time until the best option is affordable (bounded so events stay accurate).
 	local wait = 60
 	if best and baseRate.m > 0 then
 		local missing = BigNumber.subClamped(best.cost, data.currency)
 		wait = math.clamp(BigNumber.toNumber(BigNumber.div(missing, baseRate)), 1, 600)
 	end
-	-- Finite battery drains; the player walks back to recharge after a short delay.
-	local cps = EconomyMath.autoClicksPerSecond(data, ENT)
-	if cps > 0 and not EconomyMath.isAutoClickerInfinite(data, ENT) then
-		if data.autoClicker.charge <= 0 then
-			rechargeCooldown -= wait
-			if rechargeCooldown <= 0 then
-				data.autoClicker.charge = EconomyMath.autoClickerCapacity(data)
-				rechargeCooldown = 120
-			end
-		else
-			wait = math.min(wait, math.max(1, data.autoClicker.charge / cps))
-		end
-	end
-	local rate = totalRate(data)
-	if cps > 0 and not EconomyMath.isAutoClickerInfinite(data, ENT) then
-		data.autoClicker.charge = math.max(0, data.autoClicker.charge - cps * wait)
-	end
-	earn(BigNumber.mulNumber(rate, wait))
+	earn(BigNumber.mulNumber(baseRate, wait))
 	t += wait
 end
 
@@ -277,17 +293,10 @@ print("=== Pacing simulation (active play, greedy buyer) ===")
 for _, line in milestones do
 	print(line)
 end
-print(string.format("Final: evolution %d, investors %d, statues owned %d, clickLevel %d", data.evolution.level, data.investors, (function()
-	local n = 0
-	for _ in data.statues do
-		n += 1
-	end
-	return n
-end)(), data.clickLevel))
-local gens: { string } = {}
-for _, def in Economy.GENERATORS do
-	table.insert(gens, def.id .. "=" .. (data.generators[def.id] or 0))
+local parts: { string } = {}
+for _, def in Economy.STANDS do
+	local s = EconomyMath.standState(data, def.id)
+	table.insert(parts, string.format("%s m%d s%d%s", def.id, s.multiplier, s.speed, if s.managerHired then " M" else ""))
 end
-print("Generators: " .. table.concat(gens, " "))
+print("Final run: evolution " .. data.evolution.level .. " | " .. table.concat(parts, ", "))
 print("Rate: " .. NumberFormat.formatRate(totalRate(data)) .. "  sim time " .. fmtTime(t))
-local _ = Evolution

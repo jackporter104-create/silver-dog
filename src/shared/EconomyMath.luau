@@ -3,6 +3,11 @@
 	EconomyMath: pure, deterministic formulas. No Roblox APIs and no side effects.
 	Only the server uses it for authority. tools/sim.luau uses it for pacing.
 	The client never calls it; it receives precomputed values in Snapshots.
+
+	Value of one cycle of stand S:
+	  baseValue * 2^multiplierLevel * season(S) * statue(S) * global
+	  global = 42^(evo-1) * GoldenTouch * season income * x2 gamepass * statue(All) * buff
+	Interval: baseInterval / 2^speedLevel / SwiftCurrents. Rate = value / interval.
 ]]
 
 local BigNumber = require(script.Parent.BigNumber)
@@ -13,21 +18,58 @@ local Statues = require(script.Parent.Config.Statues)
 
 type BigNumber = BigNumber.BigNumber
 type PlayerData = Types.PlayerData
+type StandState = Types.StandState
 type EconomyModifiers = Types.EconomyModifiers
 type Entitlements = Types.Entitlements
+type StandDef = Economy.StandDef
+type BuffDef = Economy.BuffDef
 
 local EconomyMath = {}
 
 local ONE = BigNumber.ONE
 local ZERO = BigNumber.ZERO
+local TWO = BigNumber.fromNumber(2)
 local PERK = Evolution.PERK_VALUES
 
 EconomyMath.NEUTRAL_MODIFIERS = table.freeze({
 	incomeMultiplier = 1,
-	clickMultiplier = 1,
 	costMultiplier = 1,
-	generatorMultipliers = table.freeze({}),
+	standMultipliers = table.freeze({}),
 }) :: EconomyModifiers
+
+EconomyMath.NO_ENTITLEMENTS = table.freeze({ doubleIncome = false }) :: Entitlements
+
+local DEFAULT_STAND: StandState = table.freeze({ level = 0, multiplier = 0, speed = 0, managerHired = false })
+
+-- ===== Stand state =====
+
+function EconomyMath.standState(data: PlayerData, standId: string): StandState
+	return data.stands[standId] or DEFAULT_STAND
+end
+
+function EconomyMath.isOwned(data: PlayerData, standId: string): boolean
+	return EconomyMath.standState(data, standId).level > 0
+end
+
+function EconomyMath.isManaged(data: PlayerData, standId: string): boolean
+	local state = EconomyMath.standState(data, standId)
+	return state.level > 0 and state.managerHired
+end
+
+function EconomyMath.ownedStandCount(data: PlayerData): number
+	local count = 0
+	for _, def in Economy.STANDS do
+		if EconomyMath.isOwned(data, def.id) then
+			count += 1
+		end
+	end
+	return count
+end
+
+-- Fresh stands for a new player or a new evolution run: only the starting stand is owned.
+function EconomyMath.startingStands(): { [string]: StandState }
+	return { [Economy.STARTING_STAND] = { level = 1, multiplier = 0, speed = 0, managerHired = false } }
+end
 
 -- ===== Costs =====
 
@@ -42,31 +84,23 @@ function EconomyMath.geometricCost(baseCost: number, growth: number, owned: numb
 	return BigNumber.mul(first, series)
 end
 
-function EconomyMath.generatorCost(def: Economy.GeneratorDef, owned: number, quantity: number, mods: EconomyModifiers): BigNumber
-	return EconomyMath.geometricCost(def.baseCost, def.growth, owned, quantity, mods.costMultiplier)
+function EconomyMath.deedCost(def: StandDef, mods: EconomyModifiers): BigNumber
+	return BigNumber.fromNumber(def.deedCost * mods.costMultiplier)
 end
 
-function EconomyMath.clickUpgradeCost(level: number, quantity: number, mods: EconomyModifiers): BigNumber
-	local cfg = Economy.CLICK_UPGRADE
-	return EconomyMath.geometricCost(cfg.baseCost, cfg.growth, level, quantity, mods.costMultiplier)
+function EconomyMath.multiplierCost(def: StandDef, level: number, mods: EconomyModifiers): BigNumber
+	return EconomyMath.geometricCost(def.multiplierCost, def.multiplierGrowth, level, 1, mods.costMultiplier)
 end
 
-function EconomyMath.investorCost(owned: number, quantity: number, mods: EconomyModifiers): BigNumber
-	local cfg = Economy.INVESTOR
-	return EconomyMath.geometricCost(cfg.baseCost, cfg.growth, owned, quantity, mods.costMultiplier)
-end
-
-function EconomyMath.autoClickerTier(tier: number): Economy.AutoClickerTier?
-	return Economy.AUTO_CLICKER_TIERS[tier]
-end
-
-function EconomyMath.autoClickerTierCost(tier: number, mods: EconomyModifiers): BigNumber?
-	local def = Economy.AUTO_CLICKER_TIERS[tier]
-	if not def then
+function EconomyMath.speedCost(def: StandDef, level: number, mods: EconomyModifiers): BigNumber?
+	if level >= Economy.MAX_SPEED_LEVEL then
 		return nil
 	end
-	local base = if def.costExponent then BigNumber.fromExponent(def.costExponent) else BigNumber.fromNumber(def.cost)
-	return BigNumber.mulNumber(base, mods.costMultiplier)
+	return EconomyMath.geometricCost(def.speedCost, def.speedGrowth, level, 1, mods.costMultiplier)
+end
+
+function EconomyMath.managerCost(def: StandDef, mods: EconomyModifiers): BigNumber
+	return BigNumber.fromNumber(def.managerCost * mods.costMultiplier)
 end
 
 function EconomyMath.statueCost(def: Statues.StatueDef): BigNumber
@@ -83,116 +117,88 @@ function EconomyMath.evolutionMultiplier(level: number): BigNumber
 	return BigNumber.pow(BigNumber.fromNumber(Evolution.MULTIPLIER_BASE), math.max(level - 1, 0))
 end
 
--- Product of owned statue multipliers that target `source`. "All" statues apply only to the
--- primary sources (Click and Passive). Auto, Offline and Investor already derive from those,
--- so applying "All" there too would double-count it.
-function EconomyMath.statueMultiplier(data: PlayerData, source: Types.IncomeSource): BigNumber
-	local includeAll = source == "Click" or source == "Passive"
+-- Product of owned statues whose source is exactly `source` (a stand id, "Offline" or "All").
+function EconomyMath.statueMultiplier(data: PlayerData, source: string): BigNumber
 	local result = ONE
 	for _, statue in Statues.LIST do
-		if data.statues[statue.id] and (statue.source == source or (includeAll and statue.source == "All")) then
+		if data.statues[statue.id] and statue.source == source then
 			result = BigNumber.mulNumber(result, statue.multiplier)
 		end
 	end
 	return result
 end
 
--- Fractional bonus from Investors, for example 0.37 means +37%. Plain number for display.
-function EconomyMath.investorBonusFraction(data: PlayerData): number
-	local perInvestor = Economy.INVESTOR.bonusPerInvestor
-		+ EconomyMath.perkStacks(data, "GoldenInvestors") * PERK.goldenInvestorBonus
-	return data.investors * perInvestor
+-- Every multiplier that applies to all stands equally. `buff` is the active buff multiplier.
+function EconomyMath.globalMultiplier(data: PlayerData, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
+	local plain = PERK.goldenTouchMultiplier ^ EconomyMath.perkStacks(data, "GoldenTouch")
+		* mods.incomeMultiplier
+		* (if ent.doubleIncome then 2 else 1)
+		* buff
+	local result = BigNumber.mulNumber(EconomyMath.evolutionMultiplier(data.evolution.level), plain)
+	return BigNumber.mul(result, EconomyMath.statueMultiplier(data, "All"))
 end
 
-function EconomyMath.investorMultiplier(data: PlayerData): BigNumber
-	local bonus = BigNumber.fromNumber(EconomyMath.investorBonusFraction(data))
-	return BigNumber.add(ONE, BigNumber.mul(bonus, EconomyMath.statueMultiplier(data, "Investor")))
+-- ===== Stands =====
+
+function EconomyMath.standInterval(data: PlayerData, def: StandDef): number
+	local state = EconomyMath.standState(data, def.id)
+	local speed = math.clamp(state.speed, 0, Economy.MAX_SPEED_LEVEL)
+	return def.baseInterval / 2 ^ speed / PERK.swiftCurrentsSpeed ^ EconomyMath.perkStacks(data, "SwiftCurrents")
 end
 
--- ===== Income =====
-
-local function milestoneFactor(level: number, milestones: { Economy.Milestone }): BigNumber
-	local factor = ONE
-	for _, milestone in milestones do
-		factor = BigNumber.mul(factor, BigNumber.pow(BigNumber.fromNumber(milestone.multiplier), level // milestone.every))
-	end
-	return factor
-end
-EconomyMath.milestoneFactor = milestoneFactor
-
-function EconomyMath.generatorOutput(def: Economy.GeneratorDef, owned: number, mods: EconomyModifiers): BigNumber
-	if owned <= 0 then
-		return ZERO
-	end
-	local seasonal = mods.generatorMultipliers[def.id] or 1
-	return BigNumber.mul(BigNumber.fromNumber(def.baseOutput * owned * seasonal), milestoneFactor(owned, Economy.GENERATOR_MILESTONES))
+function EconomyMath.standCycleValue(data: PlayerData, def: StandDef, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
+	local state = EconomyMath.standState(data, def.id)
+	local value = BigNumber.mulNumber(BigNumber.pow(TWO, state.multiplier), def.baseValue * (mods.standMultipliers[def.id] or 1))
+	value = BigNumber.mul(value, EconomyMath.statueMultiplier(data, def.id))
+	return BigNumber.mul(value, EconomyMath.globalMultiplier(data, mods, ent, buff))
 end
 
-function EconomyMath.clickValue(data: PlayerData, mods: EconomyModifiers): BigNumber
-	local level = data.clickLevel
-	local perk = PERK.tidalClickMultiplier ^ EconomyMath.perkStacks(data, "TidalClicks")
-	local value = BigNumber.fromNumber((Economy.BASE_CLICK + level) * perk * mods.clickMultiplier * mods.incomeMultiplier)
-	value = BigNumber.mul(value, milestoneFactor(level, Economy.CLICK_UPGRADE.milestones))
-	value = BigNumber.mul(value, EconomyMath.evolutionMultiplier(data.evolution.level))
-	return BigNumber.mul(value, EconomyMath.statueMultiplier(data, "Click"))
+-- Payout of one hand-run cycle (Busy Fins perk applies only here).
+function EconomyMath.manualCycleValue(data: PlayerData, def: StandDef, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
+	local perk = PERK.busyFinsMultiplier ^ EconomyMath.perkStacks(data, "BusyFins")
+	return BigNumber.mulNumber(EconomyMath.standCycleValue(data, def, mods, ent, buff), perk)
 end
 
-function EconomyMath.passivePerSecond(data: PlayerData, mods: EconomyModifiers): BigNumber
+-- Hand-run cycles can never be shorter than MIN_MANUAL_INTERVAL.
+function EconomyMath.manualInterval(data: PlayerData, def: StandDef): number
+	return math.max(EconomyMath.standInterval(data, def), Economy.MIN_MANUAL_INTERVAL)
+end
+
+function EconomyMath.standRate(data: PlayerData, def: StandDef, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
+	return BigNumber.mulNumber(EconomyMath.standCycleValue(data, def, mods, ent, buff), 1 / EconomyMath.standInterval(data, def))
+end
+
+-- Income per second from every stand that has a manager.
+function EconomyMath.managedRate(data: PlayerData, mods: EconomyModifiers, ent: Entitlements, buff: number): BigNumber
 	local total = ZERO
-	for _, def in Economy.GENERATORS do
-		total = BigNumber.add(total, EconomyMath.generatorOutput(def, data.generators[def.id] or 0, mods))
+	for _, def in Economy.STANDS do
+		if EconomyMath.isManaged(data, def.id) then
+			total = BigNumber.add(total, EconomyMath.standRate(data, def, mods, ent, buff))
+		end
 	end
-	if BigNumber.isZero(total) then
-		return ZERO
+	return total
+end
+
+-- ===== Global buffs =====
+
+function EconomyMath.isBuffMilestoneReached(data: PlayerData, def: BuffDef): boolean
+	return EconomyMath.ownedStandCount(data) >= def.requiredStands
+end
+
+function EconomyMath.buffDuration(data: PlayerData, def: BuffDef): number
+	return def.duration * (1 + PERK.longTidesDuration * EconomyMath.perkStacks(data, "LongTides"))
+end
+
+-- Strongest active buff at server time `now` (os.time). Buffs never stack.
+function EconomyMath.activeBuffMultiplier(data: PlayerData, now: number): number
+	local best = 1
+	for _, def in Economy.BUFFS do
+		local state = data.buffs[def.id]
+		if state and state.activeUntil > now then
+			best = math.max(best, def.multiplier)
+		end
 	end
-	local perk = PERK.richReefsMultiplier ^ EconomyMath.perkStacks(data, "RichReefs")
-	total = BigNumber.mulNumber(total, perk * mods.incomeMultiplier)
-	total = BigNumber.mul(total, EconomyMath.investorMultiplier(data))
-	total = BigNumber.mul(total, EconomyMath.evolutionMultiplier(data.evolution.level))
-	return BigNumber.mul(total, EconomyMath.statueMultiplier(data, "Passive"))
-end
-
-function EconomyMath.isAutoClickerInfinite(data: PlayerData, ent: Entitlements): boolean
-	local def = Economy.AUTO_CLICKER_TIERS[data.autoClicker.tier]
-	return ent.infiniteAutoClicker or (def ~= nil and def.infinite)
-end
-
-function EconomyMath.autoClickerCapacity(data: PlayerData): number
-	local def = Economy.AUTO_CLICKER_TIERS[data.autoClicker.tier]
-	return if def then def.capacity else 0
-end
-
-function EconomyMath.autoClicksPerSecond(data: PlayerData, ent: Entitlements): number
-	local def = Economy.AUTO_CLICKER_TIERS[data.autoClicker.tier]
-	local cps = if def then def.clicksPerSecond else 0
-	if ent.infiniteAutoClicker then
-		cps = math.max(cps, Economy.GAMEPASS_AUTO_CPS)
-	end
-	return cps * PERK.fishFrenzyMultiplier ^ EconomyMath.perkStacks(data, "FishFrenzy")
-end
-
-function EconomyMath.isAutoClickerRunning(data: PlayerData, ent: Entitlements): boolean
-	if EconomyMath.autoClicksPerSecond(data, ent) <= 0 then
-		return false
-	end
-	return EconomyMath.isAutoClickerInfinite(data, ent) or data.autoClicker.charge > 0
-end
-
--- Income from one automated click (click value times the Auto statue multiplier).
-function EconomyMath.autoClickValue(data: PlayerData, mods: EconomyModifiers): BigNumber
-	return BigNumber.mul(EconomyMath.clickValue(data, mods), EconomyMath.statueMultiplier(data, "Auto"))
-end
-
-function EconomyMath.autoIncomePerSecond(data: PlayerData, mods: EconomyModifiers, ent: Entitlements): BigNumber
-	if not EconomyMath.isAutoClickerRunning(data, ent) then
-		return ZERO
-	end
-	return BigNumber.mulNumber(EconomyMath.autoClickValue(data, mods), EconomyMath.autoClicksPerSecond(data, ent))
-end
-
--- What the HUD shows as currency/s: passive plus the running auto-clicker.
-function EconomyMath.incomePerSecond(data: PlayerData, mods: EconomyModifiers, ent: Entitlements): BigNumber
-	return BigNumber.add(EconomyMath.passivePerSecond(data, mods), EconomyMath.autoIncomePerSecond(data, mods, ent))
+	return best
 end
 
 -- ===== Offline =====
@@ -203,19 +209,15 @@ function EconomyMath.offlineCapSeconds(data: PlayerData): number
 	return math.min(cap, cfg.maxCapSeconds)
 end
 
--- Offline generation: passive income, plus the auto-clicker only when it never drains.
--- Finite batteries do not run offline. `seconds` must already come from server time.
+-- Only managed stands work while the player is away. Buffs do not apply offline.
+-- `seconds` must already come from server time.
 function EconomyMath.offlineEarnings(data: PlayerData, mods: EconomyModifiers, ent: Entitlements, seconds: number): BigNumber
 	if seconds < Economy.OFFLINE.minSeconds then
 		return ZERO
 	end
 	local clamped = math.min(seconds, EconomyMath.offlineCapSeconds(data))
-	local rate = EconomyMath.passivePerSecond(data, mods)
-	if EconomyMath.isAutoClickerInfinite(data, ent) then
-		rate = BigNumber.add(rate, EconomyMath.autoIncomePerSecond(data, mods, ent))
-	end
 	local perk = PERK.deepCurrentsMultiplier ^ EconomyMath.perkStacks(data, "DeepCurrents")
-	local earned = BigNumber.mulNumber(rate, clamped * Economy.OFFLINE.efficiency * perk)
+	local earned = BigNumber.mulNumber(EconomyMath.managedRate(data, mods, ent, 1), clamped * Economy.OFFLINE.efficiency * perk)
 	return BigNumber.mul(earned, EconomyMath.statueMultiplier(data, "Offline"))
 end
 

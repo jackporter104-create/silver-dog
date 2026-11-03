@@ -164,23 +164,9 @@ local function nearPoint(rng: Random, center: Vector3, spread: number, footprint
 	return nil
 end
 
--- Coral bed centres in priority order. Progression fills them front to back, so the
--- arena gains framing accents first, then gaps between generators, then the outer rim.
+-- Coral bed centres in priority order (between stand plots first, then the rim).
 local function bedCenters(): { Vector3 }
-	local beds: { Vector3 } = {}
-	-- Accents on the inner ring framing the axis lanes and the clam/station pairs.
-	for _, angle in { 25, 335, 155, 205, 90, 270 } do
-		table.insert(beds, Stations.polar(angle, Stations.INNER_RING_RADIUS))
-	end
-	-- Between neighbouring generators on the outer ring.
-	for _, angle in { 52.5, 307.5, 77.5, 282.5, 102.5, 257.5, 127.5, 232.5 } do
-		table.insert(beds, Stations.polar(angle, Stations.OUTER_RING_RADIUS))
-	end
-	-- Outer rim, every 20 degrees (the stairway gap is filtered by isClearForDecor).
-	for angle = 10, 350, 20 do
-		table.insert(beds, Stations.polar(angle, 124))
-	end
-	return beds
+	return Stations.DECOR_BEDS
 end
 
 -- ===== Atmosphere =====
@@ -361,7 +347,7 @@ local function spawnDecor(theme: Types.SeasonTheme, p: Progression)
 		end
 	end
 
-	-- Bubble vents in the gaps between generators (bed list entries 7..14).
+	-- Bubble vents on the inner beds between stand plots (bed list entries 7..10).
 	for i = 1, p.bubbles do
 		local bed = beds[6 + i]
 		if bed then

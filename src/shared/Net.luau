@@ -3,10 +3,11 @@
 	Remote definitions. The server creates them and clients wait for them.
 
 	Client -> Server
-	  Action (RemoteEvent):            (stationId: string, option: number)  -- intent only, no values
+	  Action (RemoteEvent):            (stationId: string)  -- intent only, no values
 	Server -> Client
-	  Tick (UnreliableRemoteEvent):    { currencyM, currencyE, rateM, rateE, serverTime, charge }  ~1 Hz
+	  Tick (UnreliableRemoteEvent):    { currencyM, currencyE, rateM, rateE, serverTime, buffMultiplier }  ~1 Hz
 	  Snapshot (RemoteEvent):          Types.Snapshot on any state change
+	  Cycle (RemoteEvent):             Types.CycleEvent when a hand-run stand cycle starts
 	  Notify (RemoteEvent):            Types.Notification
 	  UiConfig (RemoteEvent):          Types.UiConfig (A/B variant + live overrides)
 ]]
@@ -18,6 +19,7 @@ export type Remotes = {
 	Action: RemoteEvent,
 	Tick: UnreliableRemoteEvent,
 	Snapshot: RemoteEvent,
+	Cycle: RemoteEvent,
 	Notify: RemoteEvent,
 	UiConfig: RemoteEvent,
 }
@@ -65,6 +67,7 @@ function Net.get(): Remotes
 			Action = create("RemoteEvent", "Action", folder),
 			Tick = create("UnreliableRemoteEvent", "Tick", folder),
 			Snapshot = create("RemoteEvent", "Snapshot", folder),
+			Cycle = create("RemoteEvent", "Cycle", folder),
 			Notify = create("RemoteEvent", "Notify", folder),
 			UiConfig = create("RemoteEvent", "UiConfig", folder),
 		}
@@ -75,6 +78,7 @@ function Net.get(): Remotes
 			Action = wait("Action", folder, "RemoteEvent"),
 			Tick = wait("Tick", folder, "UnreliableRemoteEvent"),
 			Snapshot = wait("Snapshot", folder, "RemoteEvent"),
+			Cycle = wait("Cycle", folder, "RemoteEvent"),
 			Notify = wait("Notify", folder, "RemoteEvent"),
 			UiConfig = wait("UiConfig", folder, "RemoteEvent"),
 		}

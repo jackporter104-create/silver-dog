@@ -1,17 +1,16 @@
 --!strict
 --[[
-	Monetization ids. 0 = disabled (the UI hides the button and the server ignores it).
+	Monetization ids. 0 = disabled (the server ignores it).
 	Replace these with your real asset ids from the Creator Dashboard.
+	Purchases are prompted from the Roblox menu or your own shop; the HUD has no buy buttons.
 ]]
 
 local Monetization = {}
 
--- Gamepass: the auto-clicker never drains (at least Economy.GAMEPASS_AUTO_CPS clicks/s).
-Monetization.INFINITE_AUTO_CLICKER_PASS_ID = 0
+-- Gamepass: x2 income from every stand, forever.
+Monetization.DOUBLE_INCOME_PASS_ID = 0
 
--- Developer product: "Battery Overcharge" fills the battery to 3x capacity
--- (grants tier 1 when the player has no auto-clicker yet).
-Monetization.BATTERY_OVERCHARGE_PRODUCT_ID = 0
-Monetization.OVERCHARGE_MULTIPLIER = 3
+-- Developer product: "Time Warp" grants Economy.TIME_WARP_SECONDS of income instantly.
+Monetization.TIME_WARP_PRODUCT_ID = 0
 
 return Monetization

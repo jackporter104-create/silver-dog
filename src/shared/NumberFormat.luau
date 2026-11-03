@@ -166,6 +166,49 @@ function NumberFormat.suffixName(x: BigNumber): string?
 	return LONG[group]
 end
 
+-- Lower-case short suffix -> group, built lazily for parse().
+local suffixGroups: { [string]: number }? = nil
+
+-- Parses "1500", "1.5K", "10B", "2.5UQq" or "1e20" (suffixes are case-insensitive).
+-- Returns nil for anything else, including negative or non-finite numbers.
+function NumberFormat.parse(text: string): BigNumber?
+	local trimmed = string.lower((string.gsub(text, "[%s,_]", "")))
+	local mantissaText, exponentText = string.match(trimmed, "^(%d*%.?%d+)e(%d+)$")
+	if mantissaText and exponentText then
+		local mantissa, exponent = tonumber(mantissaText), tonumber(exponentText)
+		if mantissa and exponent then
+			return BigNumber.new(mantissa, exponent)
+		end
+		return nil
+	end
+	local numberText, suffix = string.match(trimmed, "^(%d*%.?%d+)(%a*)$")
+	local value = if numberText then tonumber(numberText) else nil
+	if not value or not suffix then
+		return nil
+	end
+	if suffix == "" then
+		return BigNumber.fromNumber(value)
+	end
+	local groups: { [string]: number }
+	if suffixGroups then
+		groups = suffixGroups
+	else
+		groups = {}
+		for k = 1, MAX_GROUP do
+			local key = string.lower(SHORT[k])
+			if groups[key] == nil then
+				groups[key] = k
+			end
+		end
+		suffixGroups = groups
+	end
+	local group = groups[suffix]
+	if not group then
+		return nil
+	end
+	return BigNumber.new(value, group * 3)
+end
+
 function NumberFormat.shortSuffix(group: number): string?
 	return SHORT[group]
 end

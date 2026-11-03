@@ -9,7 +9,6 @@
 local Types = require(script.Parent.Parent.Types)
 
 export type UiOverrides = {
-	tapButtonScale: number?,
 	accentColor: Color3?,
 	showPerNanosecond: boolean?,
 	compactHud: boolean?,
@@ -23,7 +22,6 @@ local Experiments = {}
 
 local defaults: Types.UiConfig = {
 	variant = "default",
-	tapButtonScale = 1,
 	accentColor = Color3.fromRGB(0, 220, 255),
 	showPerNanosecond = true,
 	compactHud = false,
@@ -33,11 +31,11 @@ Experiments.UI_DEFAULTS = table.freeze(defaults)
 
 Experiments.LIST = {
 	{
-		key = "tap_button_size_v1",
+		key = "prompt_position_v1",
 		enabled = true,
 		variants = {
-			{ id = "control", weight = 50, ui = {} },
-			{ id = "large", weight = 50, ui = { tapButtonScale = 1.3 } },
+			{ id = "bottom", weight = 50, ui = {} },
+			{ id = "center", weight = 50, ui = { promptPosition = "Center" } },
 		},
 	},
 	{
@@ -49,11 +47,5 @@ Experiments.LIST = {
 		},
 	},
 } :: { Experiment }
-
--- Bounds the server enforces on any override, including live ones.
-Experiments.LIMITS = {
-	minTapScale = 0.75,
-	maxTapScale = 1.6,
-}
 
 return Experiments

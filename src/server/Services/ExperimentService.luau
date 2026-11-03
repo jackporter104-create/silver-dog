@@ -63,10 +63,6 @@ local function sanitize(raw: any): Experiments.UiOverrides
 	if typeof(raw) ~= "table" then
 		return result
 	end
-	local limits = Experiments.LIMITS
-	if typeof(raw.tapButtonScale) == "number" and raw.tapButtonScale == raw.tapButtonScale then
-		result.tapButtonScale = math.clamp(raw.tapButtonScale, limits.minTapScale, limits.maxTapScale)
-	end
 	if typeof(raw.accentColor) == "Color3" then
 		result.accentColor = raw.accentColor
 	elseif typeof(raw.accentColor) == "string" then
@@ -89,9 +85,6 @@ end
 
 local function apply(config: UiConfig, overrides: Experiments.UiOverrides)
 	local clean = sanitize(overrides)
-	if clean.tapButtonScale then
-		config.tapButtonScale = clean.tapButtonScale
-	end
 	if clean.accentColor then
 		config.accentColor = clean.accentColor
 	end
