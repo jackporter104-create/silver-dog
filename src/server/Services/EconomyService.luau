@@ -7,12 +7,15 @@
 	  buffs[buffId]   = { unlocked, activeUntil, readyAt }  (server os.time())
 
 	* Managed stands produce continuously: rate = cycle value / interval.
+	* Stands unlock in order through a single "???" Deed pad. Upgrade pads appear one by one:
+	  first payout -> Multiplier, first Multiplier -> Speed, first Speed -> Manager.
 	* Unmanaged stands produce only while the player stands on the stand's main pad.
 	  Each request starts one cycle (if none is running) and the payout lands when it ends.
 	* Rates are cached per session and recomputed only when state changes or a buff starts/ends.
 	* A 1 Hz tick applies income, completes hand-run cycles and sends a tiny Tick payload.
 	  The client extrapolates between ticks.
-	* All purchases are validated here. The client only says which pad it used.
+	* All purchases are validated here. The client only says which pad it used. Pads that are not
+	  revealed for the player are rejected. After every change ArenaService rebuilds the player's zone.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -31,6 +34,7 @@ local Stations = require(Shared.Config.Stations)
 
 local DataService = require(script.Parent.DataService)
 local SeasonService = require(script.Parent.SeasonService)
+local ArenaService = require(script.Parent.ArenaService)
 
 type BigNumber = BigNumber.BigNumber
 type PlayerData = Types.PlayerData
@@ -53,6 +57,7 @@ type Session = {
 	cycles: { [string]: ManualCycle },
 	evolveReadyNotified: boolean,
 	stairwayNotified: boolean,
+	dirty: boolean, -- state changed outside a handler (e.g. a pad was revealed); refresh on next tick
 	lastErrorAt: number,
 	pearlsStat: StringValue,
 	evolutionStat: IntValue,
@@ -109,7 +114,7 @@ end
 local function standOf(data: PlayerData, standId: string): StandState
 	local state = data.stands[standId]
 	if not state then
-		state = { level = 0, multiplier = 0, speed = 0, managerHired = false }
+		state = { level = 0, multiplier = 0, speed = 0, managerHired = false, revealed = 0 }
 		data.stands[standId] = state
 	end
 	return state
@@ -155,6 +160,7 @@ end
 
 local function view(level: number, cost: BigNumber?, locked: boolean, lockReason: string?, maxed: boolean): Types.StationView
 	return {
+		visible = true,
 		level = level,
 		cost = if cost and not maxed then BigNumber.serialize(cost) else nil,
 		locked = locked,
@@ -163,16 +169,19 @@ local function view(level: number, cost: BigNumber?, locked: boolean, lockReason
 	}
 end
 
-local function stationView(s: Session, station: StationDef): Types.StationView
+local function baseStationView(s: Session, station: StationDef): Types.StationView
 	local d, m = s.data, mods()
 	local kind = station.kind
 	local target = station.target or ""
-	if kind == "StandMain" or kind == "Multiplier" or kind == "Speed" or kind == "Manager" then
+	if kind == "Deed" then
+		local def = Economy.STAND_BY_ID[target]
+		return view(0, EconomyMath.deedCost(def, m), false, nil, EconomyMath.isOwned(d, target))
+	elseif kind == "StandMain" or kind == "Multiplier" or kind == "Speed" or kind == "Manager" then
 		local def = Economy.STAND_BY_ID[target]
 		local state = EconomyMath.standState(d, def.id)
 		local owned = state.level > 0
 		if kind == "StandMain" then
-			return view(state.level, if owned then nil else EconomyMath.deedCost(def, m), false, nil, false)
+			return view(state.level, nil, false, nil, false)
 		end
 		local lockReason = if owned then nil else "Unlock " .. def.name .. " first"
 		if kind == "Multiplier" then
@@ -199,6 +208,12 @@ local function stationView(s: Session, station: StationDef): Types.StationView
 		return view(if owned then 1 else 0, EconomyMath.statueCost(def), locked, if locked then "Heavenly Stairway locked" else nil, owned)
 	end
 	return view(0, nil, false, nil, false)
+end
+
+local function stationView(s: Session, station: StationDef): Types.StationView
+	local result = baseStationView(s, station)
+	result.visible = EconomyMath.isPadVisible(s.data, station.kind, station.target or "")
+	return result
 end
 
 local function standView(s: Session, def: StandDef, serverNow: number, clockNow: number): Types.StandView
@@ -280,9 +295,11 @@ local function updateLeaderstats(s: Session)
 	s.evolutionStat.Value = s.data.evolution.level
 end
 
--- Call after any state mutation that can change rates, costs or locks.
+-- Call after any state mutation that can change rates, costs, locks or visible pads.
 local function changed(s: Session)
+	s.dirty = false
 	refreshRates(s)
+	ArenaService.syncZone(s.player, s.data)
 	sendSnapshot(s)
 	updateLeaderstats(s)
 end
@@ -302,6 +319,12 @@ local function completeCycle(s: Session, def: StandDef, clockNow: number): boole
 	s.cycles[def.id] = nil
 	earn(s, EconomyMath.manualCycleValue(s.data, def, mods(), s.entitlements, s.buff))
 	s.data.totalRuns += 1
+	-- The first payout reveals the stand's Multiplier pad.
+	local state = standOf(s.data, def.id)
+	if state.revealed < Economy.REVEAL.Multiplier then
+		state.revealed = Economy.REVEAL.Multiplier
+		s.dirty = true
+	end
 	return true
 end
 
@@ -323,22 +346,31 @@ end
 
 -- ===== Action handlers =====
 
+local function onDeed(s: Session, def: StandDef)
+	if EconomyMath.nextStandId(s.data) ~= def.id then
+		return -- only the next stand's deed exists
+	end
+	if trySpend(s, EconomyMath.deedCost(def, mods())) then
+		local state = standOf(s.data, def.id)
+		state.level = 1
+		state.revealed = 0
+		unlockBuffs(s)
+		changed(s)
+		ArenaService.presentStand(s.player, def.id)
+		notify(s, "Success", "You discovered the " .. def.name .. "! Stand on its pad to run it.")
+		saveSoon(s)
+	end
+end
+
 local function onStandMain(s: Session, def: StandDef)
 	local state = standOf(s.data, def.id)
-	if state.level == 0 then
-		if trySpend(s, EconomyMath.deedCost(def, mods())) then
-			state.level = 1
-			unlockBuffs(s)
-			changed(s)
-			notify(s, "Success", def.name .. " unlocked! Stand on its pad to run it, or hire a manager.")
-			saveSoon(s)
-		end
-		return
-	end
-	if state.managerHired then
-		return -- the manager runs it; nothing to do by hand
+	if state.level == 0 or state.managerHired then
+		return -- not owned yet, or the manager runs it
 	end
 	startCycle(s, def)
+	if s.dirty then
+		changed(s)
+	end
 end
 
 local function onMultiplier(s: Session, def: StandDef)
@@ -347,11 +379,12 @@ local function onMultiplier(s: Session, def: StandDef)
 		fail(s, "Unlock " .. def.name .. " first!")
 		return
 	end
-	if state.multiplier >= Economy.MAX_MULTIPLIER_LEVEL then
+	if state.revealed < Economy.REVEAL.Multiplier or state.multiplier >= Economy.MAX_MULTIPLIER_LEVEL then
 		return
 	end
 	if trySpend(s, EconomyMath.multiplierCost(def, state.multiplier, mods())) then
 		state.multiplier += 1
+		state.revealed = math.max(state.revealed, Economy.REVEAL.Speed)
 		changed(s)
 	end
 end
@@ -362,6 +395,9 @@ local function onSpeed(s: Session, def: StandDef)
 		fail(s, "Unlock " .. def.name .. " first!")
 		return
 	end
+	if state.revealed < Economy.REVEAL.Speed then
+		return
+	end
 	local cost = EconomyMath.speedCost(def, state.speed, mods())
 	if not cost then
 		fail(s, def.name .. " is already at max speed!")
@@ -369,6 +405,7 @@ local function onSpeed(s: Session, def: StandDef)
 	end
 	if trySpend(s, cost) then
 		state.speed += 1
+		state.revealed = math.max(state.revealed, Economy.REVEAL.Manager)
 		changed(s)
 	end
 end
@@ -379,7 +416,7 @@ local function onManager(s: Session, def: StandDef)
 		fail(s, "Unlock " .. def.name .. " first!")
 		return
 	end
-	if state.managerHired then
+	if state.managerHired or state.revealed < Economy.REVEAL.Manager then
 		return
 	end
 	if trySpend(s, EconomyMath.managerCost(def, mods())) then
@@ -468,6 +505,10 @@ end
 local function handle(s: Session, station: StationDef)
 	local kind = station.kind
 	local target = station.target or ""
+	-- Pads that are not revealed yet do not exist for this player.
+	if not EconomyMath.isPadVisible(s.data, kind, target) then
+		return
+	end
 	if kind == "Buff" then
 		onBuff(s, target)
 	elseif kind == "Evolve" then
@@ -479,7 +520,9 @@ local function handle(s: Session, station: StationDef)
 		if not def then
 			return
 		end
-		if kind == "StandMain" then
+		if kind == "Deed" then
+			onDeed(s, def)
+		elseif kind == "StandMain" then
 			onStandMain(s, def)
 		elseif kind == "Multiplier" then
 			onMultiplier(s, def)
@@ -520,6 +563,9 @@ local function tickSession(s: Session, now: number)
 	earn(s, BigNumber.mulNumber(s.rate, dt))
 	for _, def in Economy.STANDS do
 		completeCycle(s, def, now)
+	end
+	if s.dirty then
+		changed(s)
 	end
 
 	checkMilestones(s)
@@ -573,6 +619,7 @@ function EconomyService.startSession(player: Player, data: PlayerData, entitleme
 		cycles = {},
 		evolveReadyNotified = EconomyMath.canEvolve(data),
 		stairwayNotified = EconomyMath.isStairwayUnlocked(data),
+		dirty = false,
 		lastErrorAt = 0,
 		pearlsStat = pearls,
 		evolutionStat = evolution,

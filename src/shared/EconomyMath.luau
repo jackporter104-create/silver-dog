@@ -39,7 +39,7 @@ EconomyMath.NEUTRAL_MODIFIERS = table.freeze({
 
 EconomyMath.NO_ENTITLEMENTS = table.freeze({ doubleIncome = false }) :: Entitlements
 
-local DEFAULT_STAND: StandState = table.freeze({ level = 0, multiplier = 0, speed = 0, managerHired = false })
+local DEFAULT_STAND: StandState = table.freeze({ level = 0, multiplier = 0, speed = 0, managerHired = false, revealed = 0 })
 
 -- ===== Stand state =====
 
@@ -68,7 +68,34 @@ end
 
 -- Fresh stands for a new player or a new evolution run: only the starting stand is owned.
 function EconomyMath.startingStands(): { [string]: StandState }
-	return { [Economy.STARTING_STAND] = { level = 1, multiplier = 0, speed = 0, managerHired = false } }
+	return { [Economy.STARTING_STAND] = { level = 1, multiplier = 0, speed = 0, managerHired = false, revealed = 0 } }
+end
+
+-- The only stand whose "???" Deed pad is shown: the first one in list order not yet owned.
+function EconomyMath.nextStandId(data: PlayerData): string?
+	for _, def in Economy.STANDS do
+		if not EconomyMath.isOwned(data, def.id) then
+			return def.id
+		end
+	end
+	return nil
+end
+
+-- Whether a pad of this kind exists for the player right now (progressive reveal).
+-- Hub pads (Evolve, Statue) always exist.
+function EconomyMath.isPadVisible(data: PlayerData, kind: string, target: string): boolean
+	if kind == "Deed" then
+		return EconomyMath.nextStandId(data) == target
+	elseif kind == "StandMain" then
+		return EconomyMath.isOwned(data, target)
+	elseif kind == "Multiplier" or kind == "Speed" or kind == "Manager" then
+		local state = EconomyMath.standState(data, target)
+		return state.level > 0 and state.revealed >= (Economy.REVEAL :: any)[kind]
+	elseif kind == "Buff" then
+		local buff = data.buffs[target]
+		return buff ~= nil and buff.unlocked
+	end
+	return true
 end
 
 -- ===== Costs =====

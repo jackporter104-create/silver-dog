@@ -7,8 +7,9 @@
 	  2. Station lookup against the authoritative layout
 	  3. Guard rate limit, per player per action kind
 	  4. Session loaded?
-	  5. Server-side proximity check (character within the pad's prompt radius + tolerance)
-	  6. EconomyService does the math and state change
+	  5. Server-side proximity check against the pad in the player's OWN zone (hub pads: shared)
+	  6. EconomyService rejects pads that are not revealed for this player yet
+	  7. EconomyService does the math and state change
 ]]
 
 local Players = game:GetService("Players")
@@ -31,6 +32,7 @@ local MAX_ID_LENGTH = 48
 local KICK_STRIKES = 150 -- sustained, extreme spam only; normal over-sending is just dropped
 
 local KEY_BY_KIND: { [Types.StationKind]: string } = {
+	Deed = "Purchase",
 	StandMain = "Run",
 	Multiplier = "Purchase",
 	Speed = "Purchase",

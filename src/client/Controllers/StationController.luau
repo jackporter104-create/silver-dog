@@ -7,7 +7,10 @@
 	  * Stand main pad of an owned, unmanaged stand: while you stand on it the stand keeps running.
 	  * Evolve pads: stand still on the pad for Evolution.CONFIRM_SECONDS to evolve (no accidents).
 
-	Requests are intent-only (the station id). The server re-validates ownership, cost and distance.
+	Only the player's OWN zone pads (resolved to world space from the "ZoneIndex" attribute) and the
+	shared Hub pads are considered, and only pads that are revealed for the player, so prompts never
+	show for other players' pads. Requests are intent-only (the station id). The server re-validates
+	ownership, visibility, cost and distance against the player's own zone.
 	Client throttles only keep requests under the server's Guard limits.
 ]]
 
@@ -32,7 +35,10 @@ local RUN_INTERVAL = 0.25 -- re-send rate while standing on a stand pad (server 
 local ACTION_INTERVAL = 0.2
 local INTERACT_ACTION = "OceanInteract"
 
+type Candidate = { station: StationDef, position: Vector3 }
+
 local player = Players.LocalPlayer
+local candidates: { Candidate } = {}
 local nearest: StationDef? = nil
 local standingOn: StationDef? = nil
 local standingSince = 0
@@ -76,15 +82,35 @@ local function trigger(station: StationDef)
 	send(station, ACTION_INTERVAL)
 end
 
+-- World positions of every pad this player can use: the Hub plus their own zone.
+local function rebuildCandidates()
+	table.clear(candidates)
+	local zoneAttribute = player:GetAttribute("ZoneIndex")
+	local zoneIndex = if typeof(zoneAttribute) == "number" then zoneAttribute else nil
+	for _, station in Stations.LIST do
+		local position = Stations.worldPosition(station, zoneIndex)
+		if position then
+			table.insert(candidates, { station = station, position = position })
+		end
+	end
+end
+
+local function isVisible(station: StationDef): boolean
+	local snap = StateController.snapshot()
+	local view = snap and snap.stations[station.id]
+	return view ~= nil and view.visible
+end
+
 local function scan()
 	local position = rootPosition()
 	local bestPrompt: StationDef? = nil
 	local onPad: StationDef? = nil
 	if position then
 		local bestDistance = math.huge
-		for _, station in Stations.LIST do
-			local offset = position - station.position
-			if math.abs(offset.Y) <= Stations.VERTICAL_TOLERANCE then
+		for _, candidate in candidates do
+			local station = candidate.station
+			local offset = position - candidate.position
+			if math.abs(offset.Y) <= Stations.VERTICAL_TOLERANCE and isVisible(station) then
 				local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
 				if distance <= station.promptRadius and distance < bestDistance then
 					bestPrompt, bestDistance = station, distance
@@ -136,7 +162,19 @@ function StationController.evolveHoldProgress(): number
 	return math.clamp((os.clock() - standingSince) / Evolution.CONFIRM_SECONDS, 0, 1)
 end
 
+-- World position of one of this player's pads (nil if it has no zone yet).
+function StationController.worldPosition(station: StationDef): Vector3?
+	for _, candidate in candidates do
+		if candidate.station == station then
+			return candidate.position
+		end
+	end
+	return nil
+end
+
 function StationController.init()
+	rebuildCandidates()
+	player:GetAttributeChangedSignal("ZoneIndex"):Connect(rebuildCandidates)
 	task.spawn(function()
 		while true do
 			scan()

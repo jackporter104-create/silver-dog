@@ -23,8 +23,14 @@ MonetizationService.init()
 DevService.init()
 
 local function onPlayerAdded(player: Player)
+	-- Claim a zone first so the character spawns in it while data loads.
+	if not ArenaService.assignZone(player) then
+		player:Kick("This ocean is full (8 reefs). Please join another server!")
+		return
+	end
 	local data = DataService.loadAsync(player)
 	if not data then
+		ArenaService.releaseZone(player)
 		if player:IsDescendantOf(Players) then
 			player:Kick("We couldn't load your ocean safely. Please rejoin in a moment!")
 		end
@@ -34,6 +40,7 @@ local function onPlayerAdded(player: Player)
 		-- Left while loading: release the session lock we just took.
 		DataService.saveAsync(player, true)
 		DataService.unload(player)
+		ArenaService.releaseZone(player)
 		return
 	end
 	local entitlements = MonetizationService.resolveEntitlements(player)
@@ -46,6 +53,7 @@ local function onPlayerRemoving(player: Player)
 	ExperimentService.onPlayerRemoving(player)
 	DataService.saveAsync(player, true)
 	DataService.unload(player)
+	ArenaService.releaseZone(player)
 end
 
 Players.PlayerAdded:Connect(onPlayerAdded)
