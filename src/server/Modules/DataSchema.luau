@@ -23,7 +23,7 @@ local Statues = require(Shared.Config.Statues)
 type BigNumber = BigNumber.BigNumber
 type PlayerData = Types.PlayerData
 
-export type SavedStand = { level: number, multiplier: number, speed: number, managerHired: boolean }
+export type SavedStand = { level: number, multiplier: number, speed: number, managerHired: boolean, revealed: number }
 export type SavedBuff = { unlocked: boolean, activeUntil: number, readyAt: number }
 
 export type SavedData = {
@@ -136,11 +136,19 @@ function DataSchema.fromSaved(raw: unknown): (PlayerData, { string })
 			local s = asTable(stands[def.id])
 			if s then
 				local level = readInteger(s.level, 0, 1, 0, def.id .. ".level", repairs)
+				local multiplier = readInteger(s.multiplier, 0, Economy.MAX_MULTIPLIER_LEVEL, 0, def.id .. ".multiplier", repairs)
+				local speed = readInteger(s.speed, 0, Economy.MAX_SPEED_LEVEL, 0, def.id .. ".speed", repairs)
+				local managerHired = s.managerHired == true and level > 0
+				-- Saves from before progressive pads have no `revealed`: derive it from upgrades.
+				local derived = if managerHired or speed > 0 then 3 elseif multiplier > 0 then 2 elseif level > 0 then 1 else 0
+				local revealed = if s.revealed == nil then derived else readInteger(s.revealed, 0, 3, derived, def.id .. ".revealed", repairs)
 				data.stands[def.id] = {
 					level = level,
-					multiplier = readInteger(s.multiplier, 0, Economy.MAX_MULTIPLIER_LEVEL, 0, def.id .. ".multiplier", repairs),
-					speed = readInteger(s.speed, 0, Economy.MAX_SPEED_LEVEL, 0, def.id .. ".speed", repairs),
-					managerHired = s.managerHired == true and level > 0,
+					multiplier = multiplier,
+					speed = speed,
+					managerHired = managerHired,
+					-- Never hide a pad the player has already used.
+					revealed = if level > 0 then math.max(revealed, if managerHired or speed > 0 then 3 elseif multiplier > 0 then 2 else 0) else 0,
 				}
 			end
 		end
@@ -213,7 +221,7 @@ end
 function DataSchema.toSaved(data: PlayerData): SavedData
 	local stands: { [string]: SavedStand } = {}
 	for id, s in data.stands do
-		stands[id] = { level = s.level, multiplier = s.multiplier, speed = s.speed, managerHired = s.managerHired }
+		stands[id] = { level = s.level, multiplier = s.multiplier, speed = s.speed, managerHired = s.managerHired, revealed = s.revealed }
 	end
 	local buffs: { [string]: SavedBuff } = {}
 	for id, b in data.buffs do
@@ -262,6 +270,7 @@ function DataSchema.validateSaved(saved: SavedData): (boolean, string?)
 			or not isInteger(s.multiplier, 0, Economy.MAX_MULTIPLIER_LEVEL)
 			or not isInteger(s.speed, 0, Economy.MAX_SPEED_LEVEL)
 			or typeof(s.managerHired) ~= "boolean"
+			or not isInteger(s.revealed, 0, 3)
 		then
 			return false, "stands." .. id
 		end

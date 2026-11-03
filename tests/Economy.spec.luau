@@ -86,7 +86,7 @@ check("managed = passive", approx(EconomyMath.managedRate(d, MODS, ENT, 1), 32))
 -- Global buffs: milestone unlock, strongest only, applies to all stands
 local tidal = Economy.BUFF_BY_ID.TidalRush
 check("buff locked with 1 stand", not EconomyMath.isBuffMilestoneReached(d, tidal))
-d.stands.CoralFarm = { level = 1, multiplier = 0, speed = 0, managerHired = true }
+d.stands.CoralFarm = { level = 1, multiplier = 0, speed = 0, managerHired = true, revealed = 3 }
 check("buff unlocks with 2 stands", EconomyMath.isBuffMilestoneReached(d, tidal))
 d.buffs.TidalRush = { unlocked = true, activeUntil = 130, readyAt = 220 }
 d.buffs.CoralBloom = { unlocked = true, activeUntil = 110, readyAt = 260 }
@@ -123,6 +123,25 @@ check("offline 1h = 100% managed", approx(EconomyMath.offlineEarnings(d, MODS, E
 check("offline capped at 8h", approx(EconomyMath.offlineEarnings(d, MODS, ENT, 10 * 86400), BigNumber.toNumber(rate) * 8 * 3600))
 check("offline ignores < 60s", BigNumber.isZero(EconomyMath.offlineEarnings(d, MODS, ENT, 30)))
 check("offline negative time = 0", BigNumber.isZero(EconomyMath.offlineEarnings(d, MODS, ENT, -5000)))
+
+-- Progressive reveal: one mystery deed at a time, upgrade pads one by one
+local r = newData()
+check("only next deed visible", EconomyMath.isPadVisible(r, "Deed", "CoralFarm") and not EconomyMath.isPadVisible(r, "Deed", "KelpFactory"))
+check("owned stand has no deed", not EconomyMath.isPadVisible(r, "Deed", "PearlClam"))
+check("main pad only when owned", EconomyMath.isPadVisible(r, "StandMain", "PearlClam") and not EconomyMath.isPadVisible(r, "StandMain", "CoralFarm"))
+check("no upgrade pads on a new stand", not EconomyMath.isPadVisible(r, "Multiplier", "PearlClam") and not EconomyMath.isPadVisible(r, "Speed", "PearlClam") and not EconomyMath.isPadVisible(r, "Manager", "PearlClam"))
+r.stands.PearlClam.revealed = 1
+check("Multiplier after first run", EconomyMath.isPadVisible(r, "Multiplier", "PearlClam") and not EconomyMath.isPadVisible(r, "Speed", "PearlClam"))
+r.stands.PearlClam.revealed = 2
+check("Speed after Multiplier", EconomyMath.isPadVisible(r, "Speed", "PearlClam") and not EconomyMath.isPadVisible(r, "Manager", "PearlClam"))
+r.stands.PearlClam.revealed = 3
+check("Manager after Speed", EconomyMath.isPadVisible(r, "Manager", "PearlClam"))
+r.stands.CoralFarm = { level = 1, multiplier = 0, speed = 0, managerHired = false, revealed = 0 }
+check("next deed moves on", EconomyMath.nextStandId(r) == "KelpFactory" and EconomyMath.isPadVisible(r, "Deed", "KelpFactory"))
+check("buff pad hidden until unlocked", not EconomyMath.isPadVisible(r, "Buff", "TidalRush"))
+r.buffs.TidalRush = { unlocked = true, activeUntil = 0, readyAt = 0 }
+check("buff pad shown once unlocked", EconomyMath.isPadVisible(r, "Buff", "TidalRush"))
+check("hub pads always visible", EconomyMath.isPadVisible(r, "Evolve", "GoldenTouch") and EconomyMath.isPadVisible(r, "Statue", "ClamColossus"))
 
 -- Dev command amount parsing
 local function parses(text: string, expected: BigNumber.BigNumber)

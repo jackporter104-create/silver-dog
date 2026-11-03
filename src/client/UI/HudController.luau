@@ -4,8 +4,9 @@
 	there are NO purchase buttons. Everything is bought by stepping on floor pads (or pressing E).
 	  * Currency pill: balance (extrapolated every frame) and managed income per second.
 	  * Evolution badge, and a status panel with stands owned, managers and the active buff.
-	  * Context prompt for the nearest pad, e.g. "[E] Buy Multiplier x16 - Cost: 1.5K", plus
-	    that stand's income while you are near one of its pads.
+	  * Context prompt for the nearest of the player's OWN pads (or a shared Hub pad), e.g.
+	    "[E] Buy Multiplier x16 - Cost: 1.5K", plus that stand's income while you are near it.
+	    A "???" Deed pad reads "[E] Unlock Next Business - Cost: X" and never reveals the stand.
 	Restyled live by UiConfig (A/B variants and live overrides). The client does no economy math:
 	it only formats and compares values the server sent.
 ]]
@@ -217,10 +218,10 @@ local function actionText(station: StationDef, snap: Types.Snapshot, currency: B
 	local kind = station.kind
 	local standDef = Economy.STAND_BY_ID[station.target or ""]
 	local stand = snap.stands[station.target or ""]
-	if kind == "StandMain" and standDef and stand then
-		if not stand.owned then
-			return costLine("Unlock " .. standDef.name, StateController.big(view.cost), currency)
-		elseif stand.managed then
+	if kind == "Deed" then
+		return costLine("Unlock Next Business", StateController.big(view.cost), currency)
+	elseif kind == "StandMain" and standDef and stand then
+		if stand.managed then
 			return standDef.managerName .. " is running this stand", C.success
 		end
 		return string.format("Stand here to run: +%s every %.2gs", fmt(StateController.big(stand.manualValue)), math.max(stand.interval, Economy.MIN_MANUAL_INTERVAL)), C.gold
@@ -278,7 +279,9 @@ end
 
 local function titleFor(station: StationDef): string
 	local kind: string = station.kind
-	if kind == "Evolve" then
+	if kind == "Deed" then
+		return "??? Mystery Business"
+	elseif kind == "Evolve" then
 		return "Evolution Temple"
 	elseif kind == "Buff" then
 		return "Global Buff: " .. station.displayName

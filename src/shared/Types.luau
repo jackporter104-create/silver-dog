@@ -5,11 +5,13 @@ local BigNumber = require(script.Parent.BigNumber)
 type BigNumber = BigNumber.BigNumber
 
 -- Per-stand progress. level: 0 = not owned, 1 = owned. multiplier/speed are upgrade levels.
+-- revealed: how many upgrade pads are shown (0 none, 1 Multiplier, 2 + Speed, 3 + Manager).
 export type StandState = {
 	level: number,
 	multiplier: number,
 	speed: number,
 	managerHired: boolean,
+	revealed: number,
 }
 
 -- Per-buff state. Times are server os.time() seconds (0 = never).
@@ -74,11 +76,12 @@ export type SeasonDefinition = {
 	theme: SeasonTheme,
 }
 
-export type StationKind = "StandMain" | "Multiplier" | "Speed" | "Manager" | "Buff" | "Evolve" | "Statue"
+export type StationKind = "Deed" | "StandMain" | "Multiplier" | "Speed" | "Manager" | "Buff" | "Evolve" | "Statue"
 
 -- ===== Network payloads (server -> client) =====
 
 export type StationView = {
+	visible: boolean, -- the pad exists in the player's zone (progressive reveal)
 	level: number,
 	cost: BigNumber.Serialized?, -- nil when maxed or free
 	locked: boolean,

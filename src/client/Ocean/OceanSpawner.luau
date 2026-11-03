@@ -164,7 +164,22 @@ local function nearPoint(rng: Random, center: Vector3, spread: number, footprint
 	return nil
 end
 
--- Coral bed centres in priority order (between stand plots first, then the rim).
+-- Point on a strip `inset` studs inside the square world edge; t in [0, 1) walks the perimeter.
+local function edgePoint(_rng: Random, t: number, inset: number): Vector3
+	local half = Stations.MAP_HALF - inset
+	local side = math.floor((t % 1) * 4)
+	local along = ((t % 1) * 4 - side) * 2 - 1
+	if side == 0 then
+		return Vector3.new(along * half, 0, -half)
+	elseif side == 1 then
+		return Vector3.new(half, 0, along * half)
+	elseif side == 2 then
+		return Vector3.new(-along * half, 0, half)
+	end
+	return Vector3.new(-half, 0, -along * half)
+end
+
+-- Coral bed centres in priority order (between stand plots first, then the open sea floor).
 local function bedCenters(): { Vector3 }
 	return Stations.DECOR_BEDS
 end
@@ -285,7 +300,7 @@ local RAY_FADE_DISTANCE = 30
 local function spawnLightRays(rng: Random, color: Color3, count: number)
 	for i = 1, count do
 		local angle = (i / count) * math.pi * 2 + rng:NextNumber(-0.3, 0.3)
-		local radius = rng:NextNumber(50, 120)
+		local radius = rng:NextNumber(40, Stations.MAP_HALF - 30)
 		local length = 140
 		local center = Vector3.new(math.cos(angle) * radius, 30 + length / 2, math.sin(angle) * radius)
 		local cframe = CFrame.new(center) * CFrame.Angles(0, rng:NextNumber(0, math.pi), math.rad(rng:NextNumber(6, 14)))
@@ -330,26 +345,26 @@ local function spawnDecor(theme: Types.SeasonTheme, p: Progression)
 		end
 	end
 
-	-- Kelp forest ringing the arena edge, framing the play space as a backdrop.
-	for i = 1, p.kelp do
-		local angle = (i / p.kelp) * 360 + rng:NextNumber(-4, 4)
-		local point = Stations.polar(angle, rng:NextNumber(120, 133))
+	-- Kelp forest along the world edge, framing the play space as a backdrop.
+	local kelpCount = p.kelp * 2
+	for i = 1, kelpCount do
+		local point = edgePoint(rng, (i - 1 + rng:NextNumber(0, 0.6)) / kelpCount, rng:NextNumber(8, 18))
 		if Stations.isClearForDecor(point, 1) then
 			spawnKelp(rng, point, p.vibrancy)
 		end
 	end
 
-	-- Boulders tucked into the rim between kelp.
-	for i = 1, 12 do
-		local point = Stations.polar(i * 30 + 15 + rng:NextNumber(-5, 5), rng:NextNumber(126, 131))
+	-- Boulders tucked into the edge between kelp.
+	for i = 1, 16 do
+		local point = edgePoint(rng, (i - 0.5) / 16, rng:NextNumber(12, 16))
 		if Stations.isClearForDecor(point, 4) then
 			spawnRock(rng, point)
 		end
 	end
 
-	-- Bubble vents on the inner beds between stand plots (bed list entries 7..10).
+	-- Bubble vents spread across the bed list.
 	for i = 1, p.bubbles do
-		local bed = beds[6 + i]
+		local bed = beds[1 + (i - 1) * 5]
 		if bed then
 			local point = nearPoint(rng, bed, 3, 2)
 			if point then
@@ -375,8 +390,11 @@ local function spawnCreatures(theme: Types.SeasonTheme, p: Progression, level: n
 		local schoolSize = if kind == "Manta" then 1 else math.min(remaining, rng:NextInteger(3, 7))
 		local color = vivid(theme.fishPalette[rng:NextInteger(1, #theme.fishPalette)], p.vibrancy)
 		local glowing = rng:NextNumber() < p.glowChance
-		-- Above station signs (~14 studs) and player cameras, below the light-ray bases.
-		local radius = rng:NextNumber(30, Stations.FLOOR_RADIUS - 10)
+		-- Schools circle a zone or the Hub, above station signs (~14 studs) and player cameras,
+		-- below the light-ray bases.
+		local centerIndex = rng:NextInteger(0, Stations.ZONE_COUNT)
+		local schoolCenter = if centerIndex == 0 then Vector3.zero else Stations.zoneCenter(centerIndex)
+		local radius = rng:NextNumber(25, Stations.ZONE_RADIUS)
 		local height = rng:NextNumber(20, 42)
 		local speed = rng:NextNumber(4, 9) * (if rng:NextNumber() < 0.5 then -1 else 1)
 		local phase = rng:NextNumber(0, math.pi * 2)
@@ -386,7 +404,7 @@ local function spawnCreatures(theme: Types.SeasonTheme, p: Progression, level: n
 			addSwimmer(creature, {
 				creature = creature,
 				mode = "Orbit",
-				center = Vector3.zero,
+				center = schoolCenter,
 				radius = radius,
 				height = height,
 				angularSpeed = speed / radius,
@@ -427,9 +445,9 @@ local function spawnCreatures(theme: Types.SeasonTheme, p: Progression, level: n
 			creature = creature,
 			mode = "Orbit",
 			center = Vector3.zero,
-			radius = 170 + i * 25,
-			height = 100 + i * 10, -- well above the statue platform (y 56)
-			angularSpeed = 3 / (170 + i * 25),
+			radius = Stations.MAP_HALF + 30 + i * 25,
+			height = 100 + i * 10, -- well above the statue platform
+			angularSpeed = 3 / (Stations.MAP_HALF + 30 + i * 25),
 			phase = i * math.pi,
 			bobAmplitude = 3,
 			bobSpeed = 0.2,

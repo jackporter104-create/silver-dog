@@ -7,7 +7,7 @@
 	  * Speed pad: level s divides the interval by 2^s (x2, x4, x8 ...), capped at MAX_SPEED_LEVEL.
 	  * Manager pad: once hired, the stand cycles forever on its own (and earns offline).
 	    Without a manager the player stands on the stand's main pad to run cycles by hand.
-	  * Deed: the main pad of a stand the player does not own yet. Paying the deed unlocks it.
+	  * Deed: a "???" pad for the next stand only. Stands unlock strictly in list order.
 	Pacing targets (validated with tools/sim.luau): first 1K in a few minutes, 1M around 20 min,
 	1B (first Evolution) as the first big achievement after about 1-2 hours.
 ]]
@@ -124,6 +124,14 @@ for _, def in Economy.STANDS do
 	Economy.STAND_BY_ID[def.id] = def
 end
 Economy.STARTING_STAND = "PearlClam"
+
+-- Progressive pads: StandState.revealed needed before each upgrade pad appears.
+-- 1 after the stand's first payout, 2 after the first Multiplier, 3 after the first Speed.
+Economy.REVEAL = {
+	Multiplier = 1,
+	Speed = 2,
+	Manager = 3,
+}
 
 Economy.MAX_SPEED_LEVEL = 8 -- x256 speed
 Economy.MAX_MULTIPLIER_LEVEL = 1000

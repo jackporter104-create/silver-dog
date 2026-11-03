@@ -3,8 +3,10 @@
 	Pacing simulator for the stand economy. It drives EconomyMath with a greedy "good player":
 	  * hand-runs the best unmanaged stand (MANUAL_EFFICIENCY covers walking and gaps)
 	  * uses the strongest unlocked global buff whenever it is off cooldown (time-averaged)
-	  * always buys the purchase with the best payback time. A deed is valued together with
-	    that stand's manager, because an unmanaged second stand adds nothing while you hand-run another.
+	  * always buys the purchase with the best payback time. Stands unlock in order, and a deed is
+	    valued together with the first Multiplier, Speed and the Manager (the pads that must be bought
+	    to automate it), because an unmanaged second stand adds nothing while you hand-run another.
+	  * progressive pads: Multiplier after the first run, Speed after a Multiplier, Manager after a Speed.
 	  * evolves as soon as allowed and buys statues as soon as affordable.
 	Reports active play time to each milestone. Run: python3 tools/run_luau.py tools/sim.luau
 ]]
@@ -26,13 +28,15 @@ local MAX_HOURS = 24 * 120
 local PERK_ROTATION = { "GoldenTouch", "SwiftCurrents", "GoldenTouch", "LongTides", "GoldenTouch", "BusyFins", "GoldenTouch" }
 
 local function newData(): Types.PlayerData
+	local stands = EconomyMath.startingStands()
+	stands[Economy.STARTING_STAND].revealed = Economy.REVEAL.Multiplier -- first run happens at once
 	return {
 		version = Economy.DATA_VERSION,
 		currency = BigNumber.ZERO,
 		lifetimeEarned = BigNumber.ZERO,
 		totalEarned = BigNumber.ZERO,
 		bestCurrency = BigNumber.ZERO,
-		stands = EconomyMath.startingStands(),
+		stands = stands,
 		buffs = {},
 		evolution = { level = 1, perks = {} },
 		statues = {},
@@ -132,7 +136,7 @@ end
 local function stand(id: string): Types.StandState
 	local state = data.stands[id]
 	if not state then
-		state = { level = 0, multiplier = 0, speed = 0, managerHired = false }
+		state = { level = 0, multiplier = 0, speed = 0, managerHired = false, revealed = 0 }
 		data.stands[id] = state
 	end
 	return state
@@ -140,42 +144,74 @@ end
 
 local function candidates(): { Candidate }
 	local list: { Candidate } = {}
+	local nextId = EconomyMath.nextStandId(data)
 	for _, def in Economy.STANDS do
 		local state = EconomyMath.standState(data, def.id)
 		if state.level == 0 then
-			local deed = EconomyMath.deedCost(def, MODS)
-			table.insert(list, {
-				name = def.id .. " deed",
-				cost = deed,
-				valueCost = BigNumber.add(deed, EconomyMath.managerCost(def, MODS)),
-				apply = function()
-					stand(def.id).level = 1
-				end,
-				simulate = function()
-					local s = stand(def.id)
-					s.level = 1
-					s.managerHired = true
-				end,
-			})
+			if def.id == nextId then
+				local deed = EconomyMath.deedCost(def, MODS)
+				local automation = BigNumber.add(EconomyMath.multiplierCost(def, 0, MODS), BigNumber.add(EconomyMath.speedCost(def, 0, MODS) or BigNumber.ZERO, EconomyMath.managerCost(def, MODS)))
+				table.insert(list, {
+					name = def.id .. " deed",
+					cost = deed,
+					valueCost = BigNumber.add(deed, automation),
+					apply = function()
+						local s = stand(def.id)
+						s.level = 1
+						s.revealed = Economy.REVEAL.Multiplier -- the player runs it right away
+					end,
+					simulate = function()
+						local s = stand(def.id)
+						s.level, s.multiplier, s.speed, s.managerHired, s.revealed = 1, 1, 1, true, 3
+					end,
+				})
+			end
 		else
-			table.insert(list, {
-				name = def.id .. " multiplier",
-				cost = EconomyMath.multiplierCost(def, state.multiplier, MODS),
-				apply = function()
-					stand(def.id).multiplier += 1
-				end,
-			})
+			if state.revealed >= Economy.REVEAL.Multiplier then
+				table.insert(list, {
+					name = def.id .. " multiplier",
+					cost = EconomyMath.multiplierCost(def, state.multiplier, MODS),
+					apply = function()
+						local s = stand(def.id)
+						s.multiplier += 1
+						s.revealed = math.max(s.revealed, Economy.REVEAL.Speed)
+					end,
+				})
+			end
 			local speedCost = EconomyMath.speedCost(def, state.speed, MODS)
-			if speedCost then
+			if speedCost and state.revealed >= Economy.REVEAL.Speed then
 				table.insert(list, {
 					name = def.id .. " speed",
 					cost = speedCost,
 					apply = function()
-						stand(def.id).speed += 1
+						local s = stand(def.id)
+						s.speed += 1
+						s.revealed = math.max(s.revealed, Economy.REVEAL.Manager)
 					end,
 				})
 			end
-			if not state.managerHired then
+			-- Automation package: whatever Multiplier/Speed is still needed to reveal the Manager, plus the Manager.
+			if not state.managerHired and state.revealed < Economy.REVEAL.Manager then
+				local packageCost = EconomyMath.managerCost(def, MODS)
+				if state.revealed < Economy.REVEAL.Speed then
+					packageCost = BigNumber.add(packageCost, EconomyMath.multiplierCost(def, state.multiplier, MODS))
+				end
+				packageCost = BigNumber.add(packageCost, EconomyMath.speedCost(def, state.speed, MODS) or BigNumber.ZERO)
+				table.insert(list, {
+					name = def.id .. " automate",
+					cost = packageCost,
+					apply = function()
+						local s = stand(def.id)
+						if s.revealed < Economy.REVEAL.Speed then
+							s.multiplier += 1
+						end
+						s.speed += 1
+						s.managerHired = true
+						s.revealed = Economy.REVEAL.Manager
+					end,
+				})
+			end
+			if not state.managerHired and state.revealed >= Economy.REVEAL.Manager then
 				table.insert(list, {
 					name = def.id .. " manager",
 					cost = EconomyMath.managerCost(def, MODS),
