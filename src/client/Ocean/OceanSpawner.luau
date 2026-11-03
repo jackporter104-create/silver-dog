@@ -11,6 +11,8 @@
 	  * All schools move with ONE Workspace:BulkMoveTo per frame instead of thousands of
 	    property writes. Distance-banded update rates act as LOD (far fish update every 6th frame).
 	  * Kelp sway and light-ray shimmer use TweenService (engine-side, no Lua per frame).
+	  * Decor goes into designed zones (coral beds, a kelp rim) and Stations.isClearForDecor
+	    keeps it out of walkways and stations, so the arena reads as a planned space.
 	  * Every part is anchored with CanCollide, CanTouch, CanQuery and CastShadow all false.
 	    Parts share primitive shapes and materials, so the engine can instance them.
 	  * Particle emitters are few and low-rate. Bloom is skipped on mobile.
@@ -151,28 +153,34 @@ local function loopTween(instance: Instance, info: TweenInfo, goal: { [string]: 
 	table.insert(tweens, tween)
 end
 
--- Random floor point that keeps stations, the spawn and the stairway corridor clear.
-local function floorPoint(rng: Random, minRadius: number, maxRadius: number): Vector3?
-	for _ = 1, 12 do
-		local angle = rng:NextNumber(0, math.pi * 2)
-		local radius = rng:NextNumber(minRadius, maxRadius)
-		local point = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
-		local clear = (point - Stations.SPAWN_POSITION).Magnitude > 14
-			and not (math.abs(point.X) < Stations.STAIRWAY.width and point.Z < -90)
-		if clear then
-			for _, station in Stations.LIST do
-				local offset = point - station.position
-				if Vector3.new(offset.X, 0, offset.Z).Magnitude < station.radius + 6 then
-					clear = false
-					break
-				end
-			end
-		end
-		if clear then
+-- Jittered point near `center` that keeps walkways, stations and the stairway clear.
+local function nearPoint(rng: Random, center: Vector3, spread: number, footprint: number): Vector3?
+	for _ = 1, 8 do
+		local point = center + Vector3.new(rng:NextNumber(-spread, spread), 0, rng:NextNumber(-spread, spread))
+		if Stations.isClearForDecor(point, footprint) then
 			return point
 		end
 	end
 	return nil
+end
+
+-- Coral bed centres in priority order. Progression fills them front to back, so the
+-- arena gains framing accents first, then gaps between generators, then the outer rim.
+local function bedCenters(): { Vector3 }
+	local beds: { Vector3 } = {}
+	-- Accents on the inner ring framing the axis lanes and the clam/station pairs.
+	for _, angle in { 25, 335, 155, 205, 90, 270 } do
+		table.insert(beds, Stations.polar(angle, Stations.INNER_RING_RADIUS))
+	end
+	-- Between neighbouring generators on the outer ring.
+	for _, angle in { 52.5, 307.5, 77.5, 282.5, 102.5, 257.5, 127.5, 232.5 } do
+		table.insert(beds, Stations.polar(angle, Stations.OUTER_RING_RADIUS))
+	end
+	-- Outer rim, every 20 degrees (the stairway gap is filtered by isClearForDecor).
+	for angle = 10, 350, 20 do
+		table.insert(beds, Stations.polar(angle, 124))
+	end
+	return beds
 end
 
 -- ===== Atmosphere =====
@@ -210,9 +218,10 @@ local function applyAtmosphere(theme: Types.SeasonTheme, p: Progression)
 
 	if not isMobile then
 		local bloom: BloomEffect = ensure("BloomEffect", "OceanBloom", Lighting)
-		bloom.Intensity = 0.5 + 0.5 * p.vibrancy
-		bloom.Size = 24
-		bloom.Threshold = 1.5
+		-- Gentle bloom: a high threshold keeps neon pads and orbs from smearing into streaks.
+		bloom.Intensity = 0.25 + 0.25 * p.vibrancy
+		bloom.Size = 18
+		bloom.Threshold = 2.2
 	end
 
 	local arena = Workspace:FindFirstChild("OceanArena")
@@ -279,48 +288,90 @@ local function spawnBubbles(position: Vector3, color: Color3)
 	emitter.Parent = vent
 end
 
+type LightRay = { part: Part, center: Vector3, axis: Vector3 }
+local lightRays: { LightRay } = {}
+local RAY_HIDE_DISTANCE = 22
+local RAY_FADE_DISTANCE = 30
+
+-- Faint neon sheets high above the arena. Their base stays above head height, and each
+-- frame step() fades any sheet the camera gets close to. A camera passing through a
+-- glowing sheet is what produced the white flicker streaks.
 local function spawnLightRays(rng: Random, color: Color3, count: number)
-	for _ = 1, count do
-		local position = Vector3.new(rng:NextNumber(-110, 110), 70, rng:NextNumber(-110, 110))
-		local ray = decorPart(
-			Vector3.new(rng:NextNumber(6, 14), 150, 0.2),
-			CFrame.new(position) * CFrame.Angles(math.rad(rng:NextNumber(-12, 12)), rng:NextNumber(0, math.pi), math.rad(rng:NextNumber(8, 18))),
-			color,
-			Enum.Material.Neon
-		)
-		ray.Transparency = 0.9
-		loopTween(ray, TweenInfo.new(rng:NextNumber(3, 6), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Transparency = 0.97 })
+	for i = 1, count do
+		local angle = (i / count) * math.pi * 2 + rng:NextNumber(-0.3, 0.3)
+		local radius = rng:NextNumber(50, 120)
+		local length = 140
+		local center = Vector3.new(math.cos(angle) * radius, 30 + length / 2, math.sin(angle) * radius)
+		local cframe = CFrame.new(center) * CFrame.Angles(0, rng:NextNumber(0, math.pi), math.rad(rng:NextNumber(6, 14)))
+		local ray = decorPart(Vector3.new(rng:NextNumber(6, 12), length, 0.2), cframe, color, Enum.Material.Neon)
+		ray.Transparency = 0.93
+		loopTween(ray, TweenInfo.new(rng:NextNumber(3, 6), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Transparency = 0.98 })
+		table.insert(lightRays, { part = ray, center = center, axis = cframe.UpVector * (length / 2) })
 	end
+end
+
+local function fadeLightRays(cameraPosition: Vector3)
+	for _, ray in lightRays do
+		-- Distance from the camera to the sheet's long axis segment.
+		local axisLengthSq = ray.axis:Dot(ray.axis)
+		local t = math.clamp((cameraPosition - ray.center):Dot(ray.axis) / axisLengthSq, -1, 1)
+		local distance = (cameraPosition - (ray.center + ray.axis * t)).Magnitude
+		ray.part.LocalTransparencyModifier = math.clamp((RAY_HIDE_DISTANCE + RAY_FADE_DISTANCE - distance) / RAY_FADE_DISTANCE, 0, 1)
+	end
+end
+
+local function spawnRock(rng: Random, point: Vector3)
+	local size = rng:NextNumber(5, 10)
+	decorPart(Vector3.new(size, size, size), CFrame.new(point + Vector3.new(0, size * 0.15, 0)), Color3.fromRGB(95, 100, 110), Enum.Material.Slate, Enum.PartType.Ball)
 end
 
 local function spawnDecor(theme: Types.SeasonTheme, p: Progression)
 	local rng = Random.new(DECOR_SEED)
-	for _ = 1, p.corals do
-		local point = floorPoint(rng, 16, Stations.FLOOR_RADIUS - 6)
-		if point then
-			spawnCoral(rng, point, theme.coralPalette, p.vibrancy)
+	local beds = bedCenters()
+
+	-- Coral beds: 2-4 corals around each bed centre, until the progression budget is used.
+	local placed = 0
+	for _, bed in beds do
+		if placed >= p.corals then
+			break
+		end
+		for _ = 1, rng:NextInteger(2, 4) do
+			local point = nearPoint(rng, bed, 5, 3)
+			if point and placed < p.corals then
+				spawnCoral(rng, point, theme.coralPalette, p.vibrancy)
+				placed += 1
+			end
 		end
 	end
-	for _ = 1, p.kelp do
-		local point = floorPoint(rng, 30, Stations.FLOOR_RADIUS - 4)
-		if point then
+
+	-- Kelp forest ringing the arena edge, framing the play space as a backdrop.
+	for i = 1, p.kelp do
+		local angle = (i / p.kelp) * 360 + rng:NextNumber(-4, 4)
+		local point = Stations.polar(angle, rng:NextNumber(120, 133))
+		if Stations.isClearForDecor(point, 1) then
 			spawnKelp(rng, point, p.vibrancy)
 		end
 	end
-	for _ = 1, 10 do
-		local point = floorPoint(rng, 60, Stations.FLOOR_RADIUS - 8)
-		if point then
-			local size = rng:NextNumber(5, 12)
-			decorPart(Vector3.new(size, size * 0.7, size), CFrame.new(point) * CFrame.Angles(0, rng:NextNumber(0, 6), 0), Color3.fromRGB(95, 100, 110), Enum.Material.Slate, Enum.PartType.Ball)
+
+	-- Boulders tucked into the rim between kelp.
+	for i = 1, 12 do
+		local point = Stations.polar(i * 30 + 15 + rng:NextNumber(-5, 5), rng:NextNumber(126, 131))
+		if Stations.isClearForDecor(point, 4) then
+			spawnRock(rng, point)
 		end
 	end
-	for _ = 1, p.bubbles do
-		local point = floorPoint(rng, 20, Stations.FLOOR_RADIUS - 10)
-		if point then
-			spawnBubbles(point, theme.bubbleColor)
+
+	-- Bubble vents in the gaps between generators (bed list entries 7..14).
+	for i = 1, p.bubbles do
+		local bed = beds[6 + i]
+		if bed then
+			local point = nearPoint(rng, bed, 3, 2)
+			if point then
+				spawnBubbles(point, theme.bubbleColor)
+			end
 		end
 	end
-	spawnLightRays(rng, theme.lightRayColor, if isMobile then 3 else 7)
+	spawnLightRays(rng, theme.lightRayColor, if isMobile then 3 else 6)
 end
 
 -- ===== Creatures =====
@@ -338,8 +389,9 @@ local function spawnCreatures(theme: Types.SeasonTheme, p: Progression, level: n
 		local schoolSize = if kind == "Manta" then 1 else math.min(remaining, rng:NextInteger(3, 7))
 		local color = vivid(theme.fishPalette[rng:NextInteger(1, #theme.fishPalette)], p.vibrancy)
 		local glowing = rng:NextNumber() < p.glowChance
+		-- Above station signs (~14 studs) and player cameras, below the light-ray bases.
 		local radius = rng:NextNumber(30, Stations.FLOOR_RADIUS - 10)
-		local height = rng:NextNumber(8, 40)
+		local height = rng:NextNumber(20, 42)
 		local speed = rng:NextNumber(4, 9) * (if rng:NextNumber() < 0.5 then -1 else 1)
 		local phase = rng:NextNumber(0, math.pi * 2)
 		for _ = 1, schoolSize do
@@ -362,14 +414,15 @@ local function spawnCreatures(theme: Types.SeasonTheme, p: Progression, level: n
 		remaining -= schoolSize
 	end
 
+	local jellyBeds = bedCenters()
 	if level >= 3 then
 		for _ = 1, math.min(4 + level, 12) do
-			local point = floorPoint(rng, 20, Stations.FLOOR_RADIUS - 10) or Vector3.new(0, 0, 60)
+			local point = jellyBeds[rng:NextInteger(1, #jellyBeds)]
 			local creature = FishFactory.build("Jelly", vivid(theme.fishPalette[rng:NextInteger(1, #theme.fishPalette)], p.vibrancy), rng:NextNumber(1, 1.8), true)
 			addSwimmer(creature, {
 				creature = creature,
 				mode = "Bob",
-				center = point + Vector3.new(0, rng:NextNumber(14, 30), 0),
+				center = point + Vector3.new(0, rng:NextNumber(20, 36), 0),
 				radius = 0,
 				height = 0,
 				angularSpeed = 0,
@@ -389,7 +442,7 @@ local function spawnCreatures(theme: Types.SeasonTheme, p: Progression, level: n
 			mode = "Orbit",
 			center = Vector3.zero,
 			radius = 170 + i * 25,
-			height = 55 + i * 10,
+			height = 100 + i * 10, -- well above the statue platform (y 56)
 			angularSpeed = 3 / (170 + i * 25),
 			phase = i * math.pi,
 			bobAmplitude = 3,
@@ -406,6 +459,7 @@ local function step()
 	frame += 1
 	local camera = Workspace.CurrentCamera
 	local cameraPosition = if camera then camera.CFrame.Position else Vector3.zero
+	fadeLightRays(cameraPosition)
 	local t = os.clock()
 	table.clear(bulkParts)
 	table.clear(bulkCFrames)
@@ -462,6 +516,7 @@ local function rebuild(level: number, seasonId: string)
 	end
 	table.clear(tweens)
 	table.clear(swimmers)
+	table.clear(lightRays)
 	decorFolder:ClearAllChildren()
 	fishFolder:ClearAllChildren()
 

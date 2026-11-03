@@ -17,6 +17,10 @@
         "Client": {
           "$path": "src/client"
         }
+      },
+      "$properties": {
+        "CameraMaxZoomDistance": 60,
+        "CameraMinZoomDistance": 6
       }
     },
     "Workspace": {
