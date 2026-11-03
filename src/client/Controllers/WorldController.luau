@@ -36,24 +36,20 @@ local AFFORDABLE = Color3.fromRGB(110, 255, 160)
 local EXPENSIVE = Color3.fromRGB(255, 255, 255)
 local LOCKED = Color3.fromRGB(160, 170, 185)
 
-local function makeLabel(station: StationDef, adornee: BasePart)
-	local gui = Instance.new("BillboardGui")
-	gui.Name = "Info"
-	gui.Size = UDim2.fromOffset(200, 34)
-	gui.StudsOffsetWorldSpace = Vector3.new(0, 13, 0)
-	gui.MaxDistance = 70
-	gui.LightInfluence = 0
-	gui.Adornee = adornee
+-- Adds the per-player price row to the station's server-built "Title" billboard,
+-- so name and price form one stacked sign instead of two overlapping ones.
+local function makeLabel(station: StationDef, title: BillboardGui)
 	local text = Instance.new("TextLabel")
-	text.Size = UDim2.fromScale(1, 1)
+	text.Name = "Info"
+	text.Position = UDim2.fromScale(0, 0.6)
+	text.Size = UDim2.fromScale(1, 0.4)
 	text.BackgroundTransparency = 1
 	text.Font = Enum.Font.FredokaOne
 	text.TextScaled = true
 	text.TextStrokeTransparency = 0.3
 	text.TextColor3 = EXPENSIVE
 	text.Text = ""
-	text.Parent = gui
-	gui.Parent = visuals
+	text.Parent = title
 	table.insert(labels, { station = station, text = text })
 end
 
@@ -106,13 +102,14 @@ local function buildStatue(statueId: string, position: Vector3): Model
 		p.Parent = model
 	end
 	local base = CFrame.new(position)
-	add(Vector3.new(7, 3, 7), base * CFrame.new(0, 2, 0), nil, Enum.Material.Marble)
+	-- Pedestal sits on the pad inlay (top at +1.2) and stays clear of the sign pillar.
+	add(Vector3.new(4.4, 2, 4.4), base * CFrame.new(0, 2.2, 0), nil, Enum.Material.Marble)
 	-- A leaping golden fish.
-	add(Vector3.new(4, 4, 4), base * CFrame.new(0, 9, 0), Enum.PartType.Ball)
-	add(Vector3.new(3, 3, 3), base * CFrame.new(0, 11.5, -1.5), Enum.PartType.Ball)
-	add(Vector3.new(1, 4, 3), base * CFrame.new(0, 6, 2) * CFrame.Angles(math.rad(35), 0, 0))
-	add(Vector3.new(0.6, 2, 2), base * CFrame.new(1.8, 9, 0) * CFrame.Angles(0, 0, math.rad(25)))
-	add(Vector3.new(0.6, 2, 2), base * CFrame.new(-1.8, 9, 0) * CFrame.Angles(0, 0, math.rad(-25)))
+	add(Vector3.new(4, 4, 4), base * CFrame.new(0, 7.5, 0), Enum.PartType.Ball)
+	add(Vector3.new(3, 3, 3), base * CFrame.new(0, 10, -1.5), Enum.PartType.Ball)
+	add(Vector3.new(1, 4, 3), base * CFrame.new(0, 4.5, 2) * CFrame.Angles(math.rad(35), 0, 0))
+	add(Vector3.new(0.6, 2, 2), base * CFrame.new(1.8, 7.5, 0) * CFrame.Angles(0, 0, math.rad(25)))
+	add(Vector3.new(0.6, 2, 2), base * CFrame.new(-1.8, 7.5, 0) * CFrame.Angles(0, 0, math.rad(-25)))
 	local glow = Instance.new("PointLight")
 	glow.Color = gold
 	glow.Range = 16
@@ -177,9 +174,10 @@ function WorldController.init()
 		for _, station in Stations.LIST do
 			if station.kind ~= "Clam" then
 				local model = stationsFolder:WaitForChild(station.id, 30)
-				local pad = model and model:FindFirstChild("Pad")
-				if pad and pad:IsA("BasePart") then
-					makeLabel(station, pad)
+				local pillar = model and model:WaitForChild("Pillar", 10)
+				local title = pillar and pillar:WaitForChild("Title", 10)
+				if title and title:IsA("BillboardGui") then
+					makeLabel(station, title)
 				end
 			end
 		end
